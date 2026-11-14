@@ -1011,7 +1011,12 @@ def main():
     install_terminal_quit()
     if HAVE_WEB and any(not is_media(s) for s in SOURCES):
         enable_widevine()
-    app = QApplication(sys.argv)
+    # Name the app "multiview" in the taskbar / dock instead of "python3":
+    # Wayland uses the desktop file name as the app_id, X11 uses the app name
+    # for WM_CLASS.
+    app = QApplication(["multiview"] + sys.argv[1:])
+    app.setApplicationName("multiview")
+    app.setDesktopFileName("multiview")
     if len(SOURCES) < 1:
         QMessageBox.information(None, "multiview",
                                 f"No feeds given.\n\nPass 2-4 URLs on the command line, "
