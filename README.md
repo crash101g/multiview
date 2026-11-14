@@ -90,7 +90,8 @@ Linux is the only platform multiview has been tested on so far.
 | `1`–`4` | Give that feed the audio |
 | `M` | Mute / unmute everything |
 | `S` | Solo the feed with the audio full-window (press again to return) |
-| `R` | Reload all feeds |
+| `R` | Reload the feed you're listening to (all feeds if none has audio) |
+| `Shift+R` | Reload all feeds, a few seconds apart |
 | `H` | Hide / show the title bars |
 | `F11` (`Ctrl`+`Cmd`+`F` on macOS) | Fullscreen · `Esc` leaves fullscreen or solo |
 | `Q` | Quit |
