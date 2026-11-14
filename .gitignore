@@ -1,0 +1,5 @@
+# your personal settings / rules - created on first run
+multiview.ini
+my-filters.txt
+__pycache__/
+*.pyc
