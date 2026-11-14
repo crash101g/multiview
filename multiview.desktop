@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=multiview
+Comment=Watch up to four live feeds in one window, with the ads stripped out
+# @DIR@ is replaced with the folder you cloned multiview into (see README)
+Exec=@DIR@/multiview.py
+Path=@DIR@
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;Player;
+StartupWMClass=multiview
