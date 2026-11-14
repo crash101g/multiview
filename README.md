@@ -52,6 +52,14 @@ cd multiview
 chmod +x multiview.py
 ```
 
+To give multiview its own name and icon in the taskbar and app launcher, install the desktop entry (run this from the `multiview` folder):
+
+```bash
+sed "s|@DIR@|$PWD|g" multiview.desktop > ~/.local/share/applications/multiview.desktop
+```
+
+Started from the launcher, multiview plays the feeds listed under `[feeds]` in `multiview.ini`. If you move the folder, run the command again.
+
 **macOS** (with [Homebrew](https://brew.sh))
 
 ```bash
