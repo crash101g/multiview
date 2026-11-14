@@ -18,7 +18,7 @@ Following several streams at once usually means four browser tabs, four sets of 
 - **🔊 One feed has the sound.** Press `1`–`4` to choose which feed you hear; the rest stay muted. `M` mutes everything.
 - **🛡️ Real ad blocking, not a hosts file.** Built on Brave's adblock-rust engine, with the uBlock Origin lists (filters, badware, privacy, quick-fixes, unbreak), EasyList, EasyPrivacy and Peter Lowe's list. It blocks ad and tracker requests in every frame and hides the empty ad boxes they leave behind.
 - **🚫 No pop-ups, pop-unders or hijacked redirects.** New-window ads are dropped, `window.open()` is stubbed so ad scripts give up quietly, and an ad can't redirect a feed to some other site.
-- **📼 Plays anything.** Web pages and embed players open in a built-in Chromium view. Direct streams (`rtsp://`, `.m3u8`, `.ts`, `.mp4` and more) play through VLC. You can mix both kinds in the same grid.
+- **📼 Plays anything.** Web pages and embed players open in a built-in Chromium view. IP cameras (`rtsp://`, `rtsps://`) play through mpv and reconnect by themselves. Other direct streams (`.m3u8`, `.ts`, `.mp4` and more) play through VLC. You can mix both kinds in the same grid.
 - **📋 Paste an `<iframe>` and go.** Hand it the embed code straight off a page and multiview pulls out the link itself.
 - **🪶 Tiny and readable.** One file of plain Python and Qt that you can read in one sitting.
 
@@ -45,7 +45,8 @@ The banners, sidebars and the fake "update your player" box are removed by the s
 ```bash
 sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
 pip install --user --break-system-packages adblock      # Brave's engine (recommended)
-sudo apt install vlc python3-vlc                         # only for rtsp/m3u8/etc. feeds
+sudo apt install mpv                                     # only for rtsp/rtsps cameras
+sudo apt install vlc python3-vlc                         # only for m3u8/ts/etc. feeds
 
 git clone https://github.com/crash101g/multiview.git
 cd multiview
@@ -89,6 +90,13 @@ Linux is the only platform multiview has been tested on so far.
 # mix a camera and a web page; an <iframe> tag works as-is
 ./multiview.py rtsp://192.168.1.50/live '<iframe src="https://example.com/embed/1"></iframe>'
 
+# cameras that need a login: put user:password in the URL.
+# The title bar shows it as rtsps://USER:***@... so the password stays hidden.
+# URL-encode special characters in the password (@ -> %40, # -> %23, : -> %3A).
+# Wyze RTSP is TLS-only on port 322 (rtsps://). If you paste the rtsp://...:322 link
+# the Wyze app shows, multiview switches it to rtsps:// for you.
+./multiview.py 'rtsps://USER:PASS@192.168.1.50:322/stream0' 'rtsps://USER:PASS@192.168.1.51:322/stream1'
+
 # no arguments: uses the [feeds] list in multiview.ini
 ./multiview.py
 ```
@@ -114,6 +122,8 @@ The first run creates `multiview.ini` next to the script:
 [feeds]
 1 = https://example.com/stream-a
 2 = rtsp://192.168.1.50/live
+; camera with a login - the title bar shows the password as ***
+3 = rtsp://USER:PASS@192.168.1.51/live
 
 [options]
 audio = 1              ; which feed starts with the sound (0 = all muted)

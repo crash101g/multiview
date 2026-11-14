@@ -9,6 +9,9 @@ Each feed can be either:
       -> shown in a built-in web view (Qt WebEngine)
   * a direct media stream      (rtsp://, udp://, .m3u8, .ts, .mp4, .mkv ...)
       -> played with VLC (python-vlc), same idea as tablo-vlc.py
+  * an IP camera              (rtsp://, rtsps:// - e.g. Wyze RTSP)
+      -> played with mpv embedded in the tile, auto-reconnecting.
+         Wyze: rtsps://USER:PASS@IP:322/stream0 (rtsp://...:322 is switched to rtsps)
 
 Ad blocking (web feeds):
   * Brave's ad-block engine (adblock-rust, via the "adblock" Python package)
@@ -45,6 +48,7 @@ Install (Ubuntu / Pop!_OS):
   sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
   pip install --user --break-system-packages adblock    # Brave's engine (recommended)
   sudo apt install vlc python3-vlc                       # only needed for direct streams
+  sudo apt install mpv                                   # only needed for rtsp/rtsps cameras
 """
 
 import configparser
@@ -149,9 +153,29 @@ def clean_source(text):
     return text
 
 
+def mask_password(url):
+    """Hide the password in user:pass@host URLs (for display only)."""
+    return re.sub(r"^([a-z][a-z0-9+.-]*://[^/@:]*:)[^/@]*@", r"\1***@", url, flags=re.I)
+
+
 def is_media(url):
     low = url.lower().split("?", 1)[0]
     return low.startswith(MEDIA_SCHEMES) or low.endswith(MEDIA_EXTS)
+
+
+def is_camera(url):
+    """RTSP/RTSPS camera feeds play through mpv (ffmpeg), not VLC: VLC needs the
+    live555 plugin for RTSP, which many distro builds lack, and it can't do RTSPS."""
+    return url.lower().startswith(("rtsp://", "rtsps://"))
+
+
+def fix_camera_url(url):
+    """Wyze cams serve RTSP only over TLS on port 322, but the Wyze app shows the link
+    as rtsp://IP:322/... - plain RTSP gets no answer, so switch it to rtsps://."""
+    parts = urlsplit(url)
+    if parts.scheme.lower() == "rtsp" and parts.port == 322:
+        return "rtsps" + url[len(parts.scheme):]
+    return url
 
 
 def host_of(url):
@@ -170,7 +194,7 @@ def site_of(host):
 
 
 def load_config():
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     if not INI.exists():
         INI.write_text(DEFAULT_INI)
     cfg.read(INI)
@@ -198,7 +222,7 @@ _ini_feeds, OPTS = load_config()
 VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv
 if "--no-adblock" in sys.argv:
     OPTS["adblock"] = False
-SOURCES = (_cli or _ini_feeds)[:4]
+SOURCES = [fix_camera_url(s) for s in (_cli or _ini_feeds)[:4]]
 
 if any(is_media(s) for s in SOURCES) and sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
@@ -341,7 +365,8 @@ def build_blocker():
 BLOCKER = build_blocker()
 
 
-from PyQt6.QtCore import QEvent, QMetaObject, Qt, QTimer, QUrl                             # noqa: E402
+from PyQt6.QtCore import (QEvent, QMetaObject, QProcess, QProcessEnvironment, Qt,  # noqa: E402
+                          QTimer, QUrl)
 from PyQt6.QtGui import QColor, QKeySequence, QPalette, QShortcut                       # noqa: E402
 from PyQt6.QtWidgets import (QApplication, QFrame, QGridLayout,      # noqa: E402
                              QHBoxLayout, QLabel, QMainWindow,
@@ -361,6 +386,11 @@ try:
     HAVE_VLC = True
 except Exception:
     HAVE_VLC = False
+
+import shutil                                                                              # noqa: E402
+import socket                                                                              # noqa: E402
+import tempfile                                                                            # noqa: E402
+HAVE_MPV = shutil.which("mpv") is not None
 
 
 # --------------------------------------------------------------------------- web plumbing
@@ -554,7 +584,9 @@ class Player:
     def __init__(self, url, parent, delay_ms=0):
         self.url = url
         self.started = False
-        self.kind = "vlc" if is_media(url) else "web"
+        self.kind = "mpv" if is_camera(url) else "vlc" if is_media(url) else "web"
+        if self.kind == "mpv" and not HAVE_MPV:
+            raise RuntimeError("mpv is not installed (sudo apt install mpv)")
         if self.kind == "web" and not HAVE_WEB:
             raise RuntimeError("PyQt6-WebEngine is not installed "
                                "(sudo apt install python3-pyqt6.qtwebengine)")
@@ -576,6 +608,27 @@ class Player:
                 QTimer.singleShot(delay_ms, self.start)
             else:
                 self.start()
+        elif self.kind == "mpv":
+            self.widget = QFrame(parent)
+            self.widget.setStyleSheet("background:black;")
+            self.widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+            self.muted = True                   # every feed starts muted
+            self.stopping = False
+            self.ipc = os.path.join(tempfile.gettempdir(),
+                                    f"multiview-mpv-{os.getpid()}-{id(self)}.sock")
+            self.retry_s, self.started_at, self.log_tail = 5, 0.0, ""
+            self.proc = QProcess(self.widget)
+            self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            # mpv prefers Wayland when it's available, but a Wayland surface can't be put
+            # inside our (XWayland/X11) tile, so mpv would open its own window instead.
+            # Hide Wayland from mpv so it draws through X11 into the tile (--wid).
+            env = QProcessEnvironment.systemEnvironment()
+            env.remove("WAYLAND_DISPLAY")
+            self.proc.setProcessEnvironment(env)
+            self.proc.readyReadStandardOutput.connect(self._mpv_output)
+            self.proc.finished.connect(self._mpv_exited)
+            # start once the tile has its real native window
+            QTimer.singleShot(max(delay_ms, 50), self._mpv_start)
         else:
             self.widget = QFrame(parent)
             self.widget.setStyleSheet("background:black;")
@@ -626,10 +679,68 @@ class Player:
             out.append(",".join(sels[i:i + 200]) + "{display:none !important}")
         return "\n".join(out)
 
+    # ---- mpv (RTSP / RTSPS cameras)
+    def _mpv_start(self):
+        if self.stopping:
+            return
+        self.log_tail, self.started_at = "", time.monotonic()
+        self.proc.start("mpv", [
+            "--no-config", f"--wid={int(self.widget.winId())}",
+            f"--input-ipc-server={self.ipc}",
+            "--profile=low-latency", "--hwdec=auto-safe", "--keep-open=no", "--idle=no",
+            "--rtsp-transport=tcp", "--network-timeout=10",
+            "--demuxer-lavf-o=tls_verify=0",          # Wyze cams use a self-signed cert
+            "--osc=no", "--osd-level=0", "--input-default-bindings=no",
+            "--input-vo-keyboard=no", "--input-cursor=no",   # keys/clicks go to multiview
+            f"--mute={'yes' if self.muted else 'no'}",
+            "--msg-level=all=warn", self.url])
+
+    def _mpv_output(self):
+        text = bytes(self.proc.readAllStandardOutput()).decode(errors="replace")
+        self.log_tail = (self.log_tail + text)[-4000:]
+        if VERBOSE:
+            for line in text.splitlines():
+                print(f"  [mpv {mask_password(self.url)}] {line}")
+
+    def _mpv_exited(self, *_):
+        if self.stopping:
+            return
+        shown = mask_password(self.url)
+        if "401" in self.log_tail or "Unauthorized" in self.log_tail:
+            # never retry a rejected login: Wyze cams lock you out after a few failures
+            print(f"multiview: {shown}: login rejected (401). Check the RTSP username/password "
+                  "set in the Wyze app, then press R on this feed to try again.")
+            return
+        if time.monotonic() - self.started_at > 60:
+            self.retry_s = 5                          # it was playing fine; retry quickly
+        print(f"multiview: {shown}: stream stopped, reconnecting in {self.retry_s}s")
+        QTimer.singleShot(self.retry_s * 1000, self._mpv_start)
+        self.retry_s = min(self.retry_s * 2, 60)
+
+    def _mpv_cmd(self, *command):
+        """Send one command to mpv over its IPC socket (ignored if mpv isn't up yet)."""
+        try:
+            with socket.socket(socket.AF_UNIX) as s:
+                s.settimeout(0.5)
+                s.connect(self.ipc)
+                s.sendall((json.dumps({"command": list(command)}) + "\n").encode())
+        except OSError:
+            pass
+
+    def _mpv_stop(self):
+        if self.proc.state() != QProcess.ProcessState.NotRunning:
+            self._mpv_cmd("quit")                     # lets mpv send RTSP TEARDOWN
+            if not self.proc.waitForFinished(2000):
+                self.proc.kill()
+                self.proc.waitForFinished(1000)
+
     # ---- controls
     def set_muted(self, muted):
         if self.kind == "web":
             self.widget.page().setAudioMuted(muted)
+        elif self.kind == "mpv":
+            self.muted = muted
+            self._mpv_cmd("set_property", "mute", muted)
         else:
             self.mp.audio_set_mute(muted)
 
@@ -645,12 +756,24 @@ class Player:
                 self.start()
             else:
                 self.widget.reload()
+        elif self.kind == "mpv":
+            self.stopping = True                      # don't let the exit trigger a retry
+            self._mpv_stop()
+            self.stopping, self.retry_s = False, 5
+            self._mpv_start()
         else:
             self.mp.stop()
             self.mp.play()
 
     def stop(self):
-        if self.kind == "vlc":
+        if self.kind == "mpv":
+            self.stopping = True
+            self._mpv_stop()
+            try:
+                os.unlink(self.ipc)
+            except OSError:
+                pass
+        elif self.kind == "vlc":
             self.mp.stop()
             self.mp.release()
             self.inst.release()
@@ -682,7 +805,8 @@ class Cell(QWidget):
         self.bar.setStyleSheet("background:#1b1b1b; color:#ddd;")
         bl = QHBoxLayout(self.bar)
         bl.setContentsMargins(6, 2, 6, 2)
-        short = url if len(url) < 70 else url[:67] + "..."
+        shown = mask_password(url)
+        short = shown if len(shown) < 70 else shown[:67] + "..."
         self.title = QLabel(f"{index}  {short}")
         self.btn_audio = QPushButton()
         self.btn_solo = QPushButton("⛶")
