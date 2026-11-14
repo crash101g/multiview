@@ -35,7 +35,8 @@ Keys:
   S        solo the audio feed full-window (press again to go back to grid)
   R        reload all feeds
   H        hide / show the little title bars
-  F11      fullscreen window        Esc  leave fullscreen / leave solo
+  F11      fullscreen window (Ctrl+Cmd+F on macOS)
+  Esc      leave fullscreen / leave solo
   Q        quit
 
 Install (Ubuntu / Pop!_OS):
@@ -644,6 +645,14 @@ class MultiView(QMainWindow):
             sc = QShortcut(QKeySequence(k), self)
             sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
             sc.activated.connect(fn)
+        # The platform's own fullscreen keys too: macOS takes F11 for "Show Desktop"
+        # and uses Ctrl+Cmd+F instead. Skip any that repeat F11, since two shortcuts
+        # bound to the same key are ambiguous in Qt and neither one fires.
+        for seq in QKeySequence.keyBindings(QKeySequence.StandardKey.FullScreen):
+            if seq != QKeySequence("F11"):
+                sc = QShortcut(seq, self)
+                sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
+                sc.activated.connect(self.toggle_fullscreen)
 
     def update_title(self):
         self.setWindowTitle(f"{self.base_title}  -  {BLOCKER.count:,} ads/trackers blocked")
