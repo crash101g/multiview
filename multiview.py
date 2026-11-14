@@ -30,14 +30,16 @@ Usage:
   ./multiview.py -v ...               # print every blocked request (handy for my-filters.txt)
 
 Keys:
-  1-4      give audio to that feed (others are muted)
+  click    click a feed to hear it (others are muted; all start muted)
+  1-4      give audio to that feed
+  A        audio from all feeds at once
   M        mute / unmute everything
   S        solo the audio feed full-window (press again to go back to grid)
-  R        reload all feeds
+  R        reload the feed you're listening to (all feeds if none has audio)
+  Shift+R  reload all feeds
   H        hide / show the little title bars
-  F11      fullscreen window (Ctrl+Cmd+F on macOS)
-  Esc      leave fullscreen / leave solo
-  Q        quit
+  F, F11   fullscreen (Ctrl+Cmd+F on macOS)   Esc  back to the normal window (leaves fullscreen and solo)
+  Q, Ctrl+C, Ctrl+X   quit (Ctrl+C in the terminal works too; press it twice to force-kill)
 
 Install (Ubuntu / Pop!_OS):
   sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
@@ -49,7 +51,9 @@ import configparser
 import json
 import os
 import re
+import signal
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -95,8 +99,9 @@ DEFAULT_INI = """\
 4 =
 
 [options]
-; which feed gets audio at start (1-4, or 0 for all muted)
-audio = 1
+; which feed gets audio at start (0 = all muted, 1-4, or all).
+; Click a feed to give it the audio.
+audio = 0
 ; block pop-up / new-window ads from embed pages
 block_popups = yes
 ; ad blocking with uBlock Origin / EasyList filter lists
@@ -105,6 +110,18 @@ adblock = yes
 lock_navigation = yes
 ; extra filter-list URLs, comma separated (optional)
 extra_lists =
+; strict page: the outer feed page may only load third-party scripts from
+; well-known CDNs (stops rotating-domain ad networks). The player frame inside
+; the page is not affected.
+strict_page = yes
+; extra domains the outer page may load scripts from, comma separated
+allow_scripts =
+; DRM (Widevine) for "protected content" players: auto = find one installed by
+; Chrome/Edge/Vivaldi/Chromium etc., no = off, or a path to libwidevinecdm.so
+widevine = auto
+; seconds between starting each web feed (and between reloads with Shift+R),
+; so the site isn't hit with every stream/license request at once. 0 = all at once
+stagger = 3
 """
 
 DEFAULT_MY_FILTERS = """\
@@ -159,12 +176,17 @@ def load_config():
     cfg.read(INI)
     feeds = [clean_source(v) for _, v in cfg.items("feeds")] if cfg.has_section("feeds") else []
     opts = {
-        "audio": cfg.getint("options", "audio", fallback=1),
+        "audio": cfg.get("options", "audio", fallback="0").strip().lower(),
         "block_popups": cfg.getboolean("options", "block_popups", fallback=True),
         "adblock": cfg.getboolean("options", "adblock", fallback=True),
         "lock_navigation": cfg.getboolean("options", "lock_navigation", fallback=True),
         "extra_lists": [u.strip() for u in cfg.get("options", "extra_lists", fallback="").split(",")
                         if u.strip()],
+        "strict_page": cfg.getboolean("options", "strict_page", fallback=True),
+        "allow_scripts": {d.strip().lower() for d in
+                          cfg.get("options", "allow_scripts", fallback="").split(",") if d.strip()},
+        "widevine": cfg.get("options", "widevine", fallback="auto").strip(),
+        "stagger": max(0.0, cfg.getfloat("options", "stagger", fallback=3.0)),
     }
     return [f for f in feeds if f], opts
 
@@ -319,8 +341,8 @@ def build_blocker():
 BLOCKER = build_blocker()
 
 
-from PyQt6.QtCore import Qt, QTimer, QUrl                             # noqa: E402
-from PyQt6.QtGui import QKeySequence, QShortcut                       # noqa: E402
+from PyQt6.QtCore import QEvent, QMetaObject, Qt, QTimer, QUrl                             # noqa: E402
+from PyQt6.QtGui import QColor, QKeySequence, QPalette, QShortcut                       # noqa: E402
 from PyQt6.QtWidgets import (QApplication, QFrame, QGridLayout,      # noqa: E402
                              QHBoxLayout, QLabel, QMainWindow,
                              QPushButton, QVBoxLayout, QWidget, QMessageBox)
@@ -373,6 +395,39 @@ COSMETIC_JS = r"""
 })
 """
 
+# Stream players start muted (autoplay rules) and show an "UNMUTE" button.
+# multiview decides what you hear with per-feed muting, so keep the players
+# themselves unmuted.
+UNMUTE_JS = r"""
+(() => {
+  if (window.__mvUnmute) return;
+  window.__mvUnmute = true;
+  const clicked = new WeakSet();
+  const fix = () => {
+    try {
+      for (const v of document.querySelectorAll('video, audio')) {
+        if (v.muted) v.muted = false;
+        if (v.volume === 0) v.volume = 1;
+      }
+      if (typeof window.jwplayer === 'function') {
+        const p = window.jwplayer();
+        if (p && p.getMute && p.getMute()) p.setMute(false);
+      }
+      for (const b of document.querySelectorAll('button, div, span, a')) {
+        if (clicked.has(b) || b.children.length > 2) continue;
+        if ((b.textContent || '').trim().toUpperCase() === 'UNMUTE' && b.offsetParent) {
+          clicked.add(b); b.click();
+        }
+      }
+    } catch (e) {}
+  };
+  document.addEventListener('playing', fix, true);
+  document.addEventListener('loadedmetadata', fix, true);
+  let n = 0;
+  const t = setInterval(() => { fix(); if (++n >= 30) clearInterval(t); }, 1000);
+})();
+"""
+
 if HAVE_WEB:
     RT = QWebEngineUrlRequestInfo.ResourceType
     RTYPES = {
@@ -397,11 +452,22 @@ if HAVE_WEB:
             if not url.startswith(("http://", "https://", "ws://", "wss://")):
                 return
             source = info.firstPartyUrl().toString()
-            if BLOCKER.should_block(url, source, rtype):
+            if BLOCKER.should_block(url, source, rtype) or self.strict_block(info, url, source, rtype):
                 info.block(True)
                 BLOCKER.count += 1
                 if VERBOSE:
                     print(f"  blocked {rtype:<14} {url[:110]}")
+
+        @staticmethod
+        def strict_block(info, url, source, rtype):
+            """Outer feed page may only pull third-party scripts from trusted CDNs."""
+            if not OPTS["strict_page"] or rtype != "script":
+                return False
+            top = site_of(host_of(source))
+            if site_of(host_of(info.initiator().toString())) != top:
+                return False                # request comes from the embedded player frame
+            target = site_of(host_of(url))
+            return bool(target) and target != top and target not in TRUSTED_SCRIPT_SITES
 
     class QuietPage(QWebEnginePage):
         """Swallows pop-ups, blocks off-site redirects, allows in-page fullscreen."""
@@ -409,7 +475,15 @@ if HAVE_WEB:
         def __init__(self, profile, parent):
             super().__init__(profile, parent)
             self.home_site = None
-            self.fullScreenRequested.connect(lambda req: req.accept())
+            self.on_fullscreen = None        # set by the Cell: called with True/False
+            self.in_fullscreen = False
+            self.fullScreenRequested.connect(self._fullscreen)
+
+        def _fullscreen(self, req):
+            req.accept()
+            self.in_fullscreen = req.toggleOn()
+            if self.on_fullscreen:
+                self.on_fullscreen(self.in_fullscreen)
 
         def createWindow(self, _type):
             if OPTS["block_popups"]:
@@ -436,6 +510,14 @@ if HAVE_WEB:
         def javaScriptConsoleMessage(self, *args):
             pass                            # keep the terminal quiet
 
+    # Script hosts the outer page may still use in strict_page mode.
+    TRUSTED_SCRIPT_SITES = {
+        "cloudflare.com", "jsdelivr.net", "jquery.com", "googleapis.com", "gstatic.com",
+        "unpkg.com", "bootstrapcdn.com", "jwpcdn.com", "jwplayer.com", "jwplatform.com",
+        "recaptcha.net", "google.com", "hcaptcha.com", "videojs.com", "cloudfront.net",
+        "fontawesome.com", "clappr.io",
+    } | OPTS["allow_scripts"]
+
     _PROFILE = None
     _INTERCEPTOR = None
 
@@ -447,6 +529,13 @@ if HAVE_WEB:
             if BLOCKER:
                 _INTERCEPTOR = AdInterceptor()
                 _PROFILE.setUrlRequestInterceptor(_INTERCEPTOR)
+            u = QWebEngineScript()
+            u.setName("mv-unmute")
+            u.setSourceCode(UNMUTE_JS)
+            u.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+            u.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+            u.setRunsOnSubFrames(True)
+            _PROFILE.scripts().insert(u)
             if OPTS["block_popups"]:
                 s = QWebEngineScript()
                 s.setName("mv-popup-stub")
@@ -462,8 +551,9 @@ if HAVE_WEB:
 class Player:
     """Common interface over a web view or a VLC player."""
 
-    def __init__(self, url, parent):
+    def __init__(self, url, parent, delay_ms=0):
         self.url = url
+        self.started = False
         self.kind = "vlc" if is_media(url) else "web"
         if self.kind == "web" and not HAVE_WEB:
             raise RuntimeError("PyQt6-WebEngine is not installed "
@@ -478,10 +568,14 @@ class Player:
             s.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
             s.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
             s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+            page.setBackgroundColor(QColor("black"))      # no white flash / white edges
             self.widget.setPage(page)
             if BLOCKER:
                 page.loadFinished.connect(self._on_loaded)
-            self.widget.setUrl(QUrl(url))
+            if delay_ms > 0:
+                QTimer.singleShot(delay_ms, self.start)
+            else:
+                self.start()
         else:
             self.widget = QFrame(parent)
             self.widget.setStyleSheet("background:black;")
@@ -539,9 +633,18 @@ class Player:
         else:
             self.mp.audio_set_mute(muted)
 
+    def start(self):
+        """First load of a web feed (may be delayed so feeds don't all start at once)."""
+        if self.kind == "web" and not self.started:
+            self.started = True
+            self.widget.setUrl(QUrl(self.url))
+
     def reload(self):
         if self.kind == "web":
-            self.widget.reload()
+            if not self.started:
+                self.start()
+            else:
+                self.widget.reload()
         else:
             self.mp.stop()
             self.mp.play()
@@ -555,11 +658,21 @@ class Player:
             self.widget.setUrl(QUrl("about:blank"))
 
 
+def paint_black(widget):
+    """Make a plain container widget actually fill its background with black
+    (Qt leaves plain QWidgets unpainted, which shows up as white gaps)."""
+    pal = widget.palette()
+    pal.setColor(QPalette.ColorRole.Window, QColor("black"))
+    widget.setPalette(pal)
+    widget.setAutoFillBackground(True)
+
+
 class Cell(QWidget):
     """One grid tile: a small title bar + the player."""
 
-    def __init__(self, index, url, window):
+    def __init__(self, index, url, window, delay_ms=0):
         super().__init__()
+        paint_black(self)
         self.index, self.window = index, window
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -589,8 +702,11 @@ class Cell(QWidget):
         lay.addWidget(self.bar)
 
         try:
-            self.player = Player(url, self)
+            self.player = Player(url, self, delay_ms)
             lay.addWidget(self.player.widget, 1)
+            if self.player.kind == "web":
+                self.player.widget.page().on_fullscreen = \
+                    lambda on: window.page_fullscreen(index, on)
         except RuntimeError as e:
             self.player = None
             err = QLabel(str(e))
@@ -606,24 +722,38 @@ class Cell(QWidget):
 class MultiView(QMainWindow):
     def __init__(self, sources):
         super().__init__()
-        self.base_title = f"multiview - {len(sources)} feed{'s' if len(sources) != 1 else ''}"
+        self.base_title = f"multiview - {len(sources)} feeds"
         self.setWindowTitle(self.base_title)
         self.resize(1600, 900)
         self.setStyleSheet("background:black;")
         self.solo = None
         self.all_muted = False
         self.audio = 0
+        self.audio_all = False
+        self.was_maximized = False
+        self.bars_visible = True
 
         central = QWidget()
+        paint_black(central)
         self.grid = QGridLayout(central)
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setSpacing(2)
         self.setCentralWidget(central)
 
-        self.cells = [Cell(i + 1, url, self) for i, url in enumerate(sources)]
+        step = int(OPTS["stagger"] * 1000)
+        web_n = 0
+        self.cells = []
+        for i, url in enumerate(sources):
+            delay = 0 if is_media(url) else web_n * step
+            web_n += 0 if is_media(url) else 1
+            self.cells.append(Cell(i + 1, url, self, delay))
         self.layout_grid()
         start = OPTS["audio"]
-        self.set_audio(start if 1 <= start <= len(self.cells) else 0)
+        if start == "all":
+            self.set_audio_all()
+        else:
+            start = int(start) if start.isdigit() else 0
+            self.set_audio(start if 1 <= start <= len(self.cells) else 0)
 
         if BLOCKER:
             self.stats = QTimer(self)
@@ -632,15 +762,20 @@ class MultiView(QMainWindow):
 
         keys = {
             "Q": self.close, "Ctrl+Q": self.close,
+            "Ctrl+C": self.close, "Ctrl+X": self.close,
             "M": self.toggle_mute_all,
             "S": lambda: self.toggle_solo(self.audio or 1),
-            "R": self.reload_all,
+            "R": self.reload_current,
+            "Shift+R": self.reload_all,
             "H": self.toggle_bars,
+            "A": self.set_audio_all,
+            "F": self.toggle_fullscreen,
             "F11": self.toggle_fullscreen,
             "Esc": self.escape,
         }
         for n in range(1, len(self.cells) + 1):
             keys[str(n)] = lambda n=n: self.set_audio(n)
+        QApplication.instance().installEventFilter(self)
         for k, fn in keys.items():
             sc = QShortcut(QKeySequence(k), self)
             sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
@@ -654,6 +789,17 @@ class MultiView(QMainWindow):
                 sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
                 sc.activated.connect(self.toggle_fullscreen)
 
+    def eventFilter(self, obj, ev):
+        """A mouse click anywhere on a feed gives that feed the audio."""
+        if ev.type() == QEvent.Type.MouseButtonPress and isinstance(obj, QWidget):
+            for cell in self.cells:
+                w = cell.player.widget if cell.player else None
+                if w is not None and (obj is w or w.isAncestorOf(obj)):
+                    if self.audio != cell.index or self.audio_all or self.all_muted:
+                        self.set_audio(cell.index)
+                    break
+        return False                        # let the click reach the player too
+
     def update_title(self):
         self.setWindowTitle(f"{self.base_title}  -  {BLOCKER.count:,} ads/trackers blocked")
 
@@ -665,10 +811,9 @@ class MultiView(QMainWindow):
         for cell, (r, c) in zip(self.cells, positions):
             self.grid.addWidget(cell, r, c)
             cell.show()
-        self.grid.setRowStretch(0, 1)
-        self.grid.setRowStretch(1, 1 if n > 2 else 0)
-        self.grid.setColumnStretch(0, 1)
-        self.grid.setColumnStretch(1, 1 if n > 1 else 0)
+        for i in range(2):
+            self.grid.setRowStretch(i, 1 if n > 2 or i == 0 else 0)
+            self.grid.setColumnStretch(i, 1)
 
     def toggle_solo(self, index):
         if self.solo == index:
@@ -682,8 +827,17 @@ class MultiView(QMainWindow):
             self.set_audio(index)
 
     # ---- audio
+    def set_audio_all(self):
+        self.audio_all = True
+        self.all_muted = False
+        for cell in self.cells:
+            if cell.player:
+                cell.player.set_muted(False)
+            cell.set_audio_icon(True)
+
     def set_audio(self, index):
         self.audio = index
+        self.audio_all = False
         self.all_muted = False
         for cell in self.cells:
             on = cell.index == index
@@ -694,29 +848,77 @@ class MultiView(QMainWindow):
     def toggle_mute_all(self):
         self.all_muted = not self.all_muted
         for cell in self.cells:
-            on = (not self.all_muted) and cell.index == self.audio
+            on = (not self.all_muted) and (self.audio_all or cell.index == self.audio)
             if cell.player:
                 cell.player.set_muted(not on)
             cell.set_audio_icon(on)
 
     # ---- misc
-    def reload_all(self):
-        for cell in self.cells:
+    def reload_current(self):
+        """Reload only the feed that has the audio (click a broken feed, then press R)."""
+        cell = next((c for c in self.cells if c.index == self.audio), None)
+        if cell and not self.audio_all:
             if cell.player:
+                cell.player.reload()
+        else:
+            self.reload_all()
+
+    def reload_all(self):
+        """Reload every feed, spaced out by the stagger setting."""
+        step = int(OPTS["stagger"] * 1000)
+        n = 0
+        for cell in self.cells:
+            if not cell.player:
+                continue
+            if cell.player.kind == "web" and step:
+                QTimer.singleShot(n * step, cell.player.reload)
+                n += 1
+            else:
                 cell.player.reload()
 
     def toggle_bars(self):
+        self.bars_visible = not self.bars_visible
+        self.apply_bars()
+
+    def apply_bars(self):
+        """Title bars (feed number + URL) never show in fullscreen."""
+        show = self.bars_visible and not self.isFullScreen()
         for cell in self.cells:
-            cell.bar.setVisible(not cell.bar.isVisible())
+            cell.bar.setVisible(show)
+
+    def enter_fullscreen(self):
+        if not self.isFullScreen():
+            self.was_maximized = self.isMaximized()
+            self.showFullScreen()
+        self.apply_bars()
+
+    def leave_fullscreen(self):
+        if self.isFullScreen():
+            self.showMaximized() if self.was_maximized else self.showNormal()
+        self.apply_bars()
 
     def toggle_fullscreen(self):
-        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+        self.leave_fullscreen() if self.isFullScreen() else self.enter_fullscreen()
+
+    def page_fullscreen(self, index, on):
+        """The player's own fullscreen button: that feed alone, whole screen."""
+        if on:
+            if self.solo != index:
+                self.toggle_solo(index)
+            self.enter_fullscreen()
+        else:
+            self.escape()
 
     def escape(self):
+        """Esc: always back to the normal window with every feed showing."""
+        for cell in self.cells:
+            page = cell.player.widget.page() if cell.player and cell.player.kind == "web" else None
+            if page is not None and page.in_fullscreen:
+                page.in_fullscreen = False
+                page.triggerAction(QWebEnginePage.WebAction.ExitFullScreen)
         if self.solo is not None:
             self.toggle_solo(self.solo)
-        elif self.isFullScreen():
-            self.showNormal()
+        self.leave_fullscreen()
 
     def closeEvent(self, ev):
         for cell in self.cells:
@@ -725,10 +927,90 @@ class MultiView(QMainWindow):
         super().closeEvent(ev)
 
 
+def find_widevine():
+    """Return the newest libwidevinecdm.so installed by any Chromium-based app."""
+    setting = OPTS["widevine"]
+    if setting.lower() in ("no", "off", "false", "0", ""):
+        return None
+    if setting.lower() != "auto":
+        return setting if os.path.exists(setting) else None
+    home = Path.home()
+    lib = "_platform_specific/linux_x64/libwidevinecdm.so"
+    patterns = [                       # where Chrome, Chromium, Edge, Vivaldi, Brave, Electron... keep it
+        (Path("/opt"), f"*/*/WidevineCdm/{lib}"),
+        (Path("/opt"), f"*/*/*/WidevineCdm/{lib}"),
+        (Path("/usr/lib"), f"*/WidevineCdm/{lib}"),
+        (home / ".config", f"*/WidevineCdm/*/{lib}"),
+        (home / ".config", f"*/*/WidevineCdm/*/{lib}"),
+        (home / ".var/app", f"*/config/*/WidevineCdm/*/{lib}"),
+        (home / ".var/app", f"*/config/*/*/WidevineCdm/*/{lib}"),
+        (home / ".local/share/flatpak/app", f"*/*/*/*/files/extra/WidevineCdm/{lib}"),
+        (Path("/var/lib/flatpak/app"), f"*/*/*/*/files/extra/WidevineCdm/{lib}"),
+    ]
+    best, best_ver = None, ()
+    for root, pattern in patterns:
+        if not root.is_dir():
+            continue
+        try:
+            for found in root.glob(pattern):
+                ver = ()
+                try:
+                    ver = tuple(int(x) for x in json.loads(
+                        (found.parents[2] / "manifest.json").read_text())["version"].split("."))
+                except Exception:
+                    pass
+                if best is None or ver > best_ver:
+                    best, best_ver = found, ver
+        except OSError:
+            continue
+    return str(best) if best else None
+
+
+def enable_widevine():
+    lib = find_widevine()
+    if not lib:
+        if OPTS["widevine"].lower() not in ("no", "off", "false", "0", ""):
+            print("multiview: no Widevine (DRM) library found - protected streams won't play.\n"
+                  "           Installing Google Chrome provides one.")
+        return
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    if "--widevine-path" not in flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f'{flags} --widevine-path="{lib}"'.strip()
+    print(f"multiview: DRM (Widevine) on: {lib}")
+
+
+def install_terminal_quit():
+    """Make Ctrl+C (SIGINT) / SIGTERM from the terminal always work.
+
+    Qt's event loop keeps Python's normal signal handling from running, and a
+    hung page could freeze the GUI thread entirely.  So the signals are blocked
+    here (before Qt starts any threads, which inherit the mask) and a separate
+    thread waits for them: the first one asks Qt to quit cleanly, and if the
+    app is still alive 3 s later - or a second Ctrl+C arrives - it is killed.
+    """
+    sigs = {signal.SIGINT, signal.SIGTERM}
+    signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+
+    def waiter():
+        signal.sigwait(sigs)
+        print("\nmultiview: quitting (Ctrl+C again to force)", flush=True)
+        app = QApplication.instance()
+        if app is not None:
+            QMetaObject.invokeMethod(app, "quit", Qt.ConnectionType.QueuedConnection)
+            signal.sigtimedwait(sigs, 3)
+        print("multiview: forced exit", flush=True)
+        os._exit(130)
+
+    threading.Thread(target=waiter, daemon=True).start()
+
+
 def main():
     if "-h" in sys.argv or "--help" in sys.argv:
         print(__doc__)
         return
+    install_terminal_quit()
+    if HAVE_WEB and any(not is_media(s) for s in SOURCES):
+        enable_widevine()
     app = QApplication(sys.argv)
     if len(SOURCES) < 1:
         QMessageBox.information(None, "multiview",
