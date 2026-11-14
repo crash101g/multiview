@@ -52,7 +52,25 @@ cd multiview
 chmod +x multiview.py
 ```
 
-**Other platforms:** `pip install PyQt6 PyQt6-WebEngine adblock python-vlc` (plus VLC itself for direct streams). The script runs on Linux, macOS and Windows; Linux is where it's been tested.
+**macOS** (with [Homebrew](https://brew.sh))
+
+```bash
+brew install python
+brew install --cask vlc                                  # only for rtsp/m3u8/etc. feeds
+
+git clone https://github.com/crash101g/multiview.git
+cd multiview
+python3 -m venv .venv
+source .venv/bin/activate
+pip install PyQt6 PyQt6-WebEngine adblock python-vlc
+chmod +x multiview.py
+```
+
+Run `source .venv/bin/activate` in each new terminal before starting multiview. python-vlc finds VLC in `/Applications/VLC.app`. Use `Ctrl`+`Cmd`+`F` for fullscreen, because macOS keeps `F11` for Show Desktop. Web feeds should work as they do on Linux. Direct streams through VLC haven't been tested on a Mac yet.
+
+**Windows:** `pip install PyQt6 PyQt6-WebEngine adblock python-vlc` (plus VLC itself for direct streams). This should work but hasn't been tested.
+
+Linux is the only platform multiview has been tested on so far.
 
 ## Use
 
@@ -74,7 +92,7 @@ chmod +x multiview.py
 | `S` | Solo the feed with the audio full-window (press again to return) |
 | `R` | Reload all feeds |
 | `H` | Hide / show the title bars |
-| `F11` | Fullscreen · `Esc` leaves fullscreen or solo |
+| `F11` (`Ctrl`+`Cmd`+`F` on macOS) | Fullscreen · `Esc` leaves fullscreen or solo |
 | `Q` | Quit |
 
 Each tile also has 🔊 / ⛶ / ⟳ buttons in its title bar.
