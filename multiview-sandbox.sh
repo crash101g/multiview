@@ -64,7 +64,9 @@ Linux)
         --setenv MULTIVIEW_SANDBOXED 1     # tells multiview.py not to restart itself in a sandbox
         --setenv XDG_RUNTIME_DIR "$RUNDIR"
         --setenv XDG_CACHE_HOME "${CACHE%/multiview}"
-        --unsetenv DBUS_SESSION_BUS_ADDRESS  # no session bus: it can launch programs outside
+        # no session bus (it can launch programs outside). Point at one that does not exist,
+        # so Chromium does not keep trying to start its own with dbus-launch.
+        --setenv DBUS_SESSION_BUS_ADDRESS "unix:path=/run/no-session-bus"
         --unsetenv SESSION_MANAGER
         --chdir "$HERE"
     )
