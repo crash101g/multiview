@@ -11,7 +11,8 @@
 #   Linux: bubblewrap (bwrap)       sudo apt install bubblewrap
 #   macOS: sandbox-exec + multiview.sb (built into macOS)
 #
-# Usage: same arguments as multiview.py, e.g.
+# multiview.py runs this for you (unless --no-sandbox / sandbox = no), so you
+# normally don't start it yourself. Usage: same arguments as multiview.py, e.g.
 #   ./multiview-sandbox.sh
 #   ./multiview-sandbox.sh -v URL1 URL2
 #   MULTIVIEW_SANDBOX_DEBUG=1 ./multiview-sandbox.sh   # print the sandbox command
@@ -60,6 +61,7 @@ Linux)
         --ro-bind-try "$RUNDIR/pipewire-0" "$RUNDIR/pipewire-0"
         --ro-bind-try "$RUNDIR/pulse/native" "$RUNDIR/pulse/native"
         --setenv HOME "$HOME"
+        --setenv MULTIVIEW_SANDBOXED 1     # tells multiview.py not to restart itself in a sandbox
         --setenv XDG_RUNTIME_DIR "$RUNDIR"
         --setenv XDG_CACHE_HOME "${CACHE%/multiview}"
         --unsetenv DBUS_SESSION_BUS_ADDRESS  # no session bus: it can launch programs outside
@@ -104,6 +106,7 @@ Darwin)
     CACHE="$HOME/Library/Caches/multiview"
     mkdir -p "$CACHE"
     export XDG_CACHE_HOME="$HOME/Library/Caches"     # multiview.py keeps its lists in $XDG_CACHE_HOME/multiview
+    export MULTIVIEW_SANDBOXED=1                     # tells multiview.py not to restart itself in a sandbox
     PY="${MULTIVIEW_PYTHON:-$(command -v python3)}"
     # Resolve symlinks so the profile can allow the real paths.
     PY_REAL="$("$PY" -c 'import sys, os; print(os.path.realpath(sys.executable))')"
