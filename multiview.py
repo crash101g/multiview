@@ -32,6 +32,9 @@ Usage:
   ./multiview.py --no-adblock ...     # turn blocking off for this run
   ./multiview.py -v ...               # print every blocked request (handy for my-filters.txt)
   ./multiview.py --no-sandbox ...     # run without the OS sandbox (also: sandbox = no in multiview.ini)
+  ./multiview.py --logs=LEVEL ...     # terminal noise: all, important (default), fatal or none (also: log_level =)
+  ./multiview.py --webrtc ...         # allow WebRTC peer-to-peer in web feeds this run (off by default;
+                                      #   also: webrtc = on). --no-webrtc forces it off
 
 Sandbox: multiview restarts itself inside an OS sandbox (bubblewrap on Linux,
 sandbox-exec on macOS - see multiview-sandbox.sh) so a hostile web page that
@@ -134,6 +137,18 @@ widevine = auto
 stagger = 3
 ; run inside the OS sandbox (bubblewrap / sandbox-exec). no = run unsandboxed
 sandbox = yes
+; how much browser-engine (Chromium) logging to show in the terminal:
+;   all       = everything
+;   important = (default) hide the known-harmless lines (D-Bus, .local, STUN,
+;               data-channel close); show a once-a-minute summary of dropped WebRTC uploads
+;   fatal     = only crashes (Chromium FATAL)        (critical = same thing)
+;   none      = no browser-engine output at all
+; multiview's own messages always show.
+log_level = important
+; WebRTC peer-to-peer in web feeds. off (default) = pages can't open peer
+; connections (stops P2P video sharing / upload and local-IP leaks).
+; If a web feed won't play, it may need WebRTC: set webrtc = on (or run with --webrtc).
+webrtc = off
 """
 
 DEFAULT_MY_FILTERS = """\
@@ -300,21 +315,131 @@ def load_config():
                           cfg.get("options", "allow_scripts", fallback="").split(",") if d.strip()},
         "widevine": cfg.get("options", "widevine", fallback="auto").strip(),
         "stagger": max(0.0, cfg.getfloat("options", "stagger", fallback=3.0)),
+        "log_level": cfg.get("options", "log_level", fallback="important").strip().lower(),
+        "webrtc": cfg.getboolean("options", "webrtc", fallback=False),
     }
     return [f for f in feeds if f], opts
 
 
 # Pick sources before importing Qt: VLC can only embed into an X11 window, so on
 # Wayland (Pop!_OS COSMIC) we ask Qt to run through XWayland when VLC is needed.
-_cli = [clean_source(a) for a in sys.argv[1:] if not a.startswith("-")]
+def _cli_value(name):
+    """Value of --name=VALUE or --name VALUE on the command line (None if absent)."""
+    for i, a in enumerate(sys.argv[1:], 1):
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+        if a == name and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+_cli_logs = _cli_value("--logs")
+_cli = [clean_source(a) for i, a in enumerate(sys.argv[1:], 1)
+        if not a.startswith("-") and sys.argv[i - 1] != "--logs"]
 _ini_feeds, OPTS = load_config()
 VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv
 if "--no-adblock" in sys.argv:
     OPTS["adblock"] = False
+if _cli_logs is not None:
+    OPTS["log_level"] = _cli_logs.strip().lower()
+if "--webrtc" in sys.argv:
+    OPTS["webrtc"] = True
+if "--no-webrtc" in sys.argv:
+    OPTS["webrtc"] = False
 SOURCES = [fix_camera_url(s) for s in (_cli or _ini_feeds)[:4]]
 
 if any(is_media(s) for s in SOURCES) and sys.platform.startswith("linux"):
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
+
+# --------------------------------------------------------------------------- terminal logs
+LOG_LEVELS = {"all": "all", "important": "important", "fatal": "fatal", "critical": "fatal",
+              "none": "none", "off": "none", "quiet": "none"}
+
+# Chromium log line: [pid:tid:MMDD/HHMMSS.usec:LEVEL:file.cc(123)] message
+CHROMIUM_LINE = re.compile(rb"^\[\d+:\d+:\d{4}/\d{6}\.\d+:([A-Z]+):([\w.\-]+)\(\d+\)\] ?(.*)")
+# Known-harmless Chromium errors hidden at log_level = important: (file, text in message)
+HARMLESS = [
+    (b"bus.cc", b"Failed to connect to the bus"),           # sandbox hides D-Bus on purpose
+    (b"socket_manager.cc", b".local."),                     # WebRTC mDNS names, no mDNS here
+    (b"dcsctp_transport.cc", b"WRONG_SEQUENCE"),            # data channel closed after its peer
+    (b"stun_port.cc", b"Binding request timed out"),        # mostly IPv6 with no IPv6 route
+]
+UDP_FULL = (b"stun_port.cc", b"failed with error 11")      # EAGAIN: outgoing UDP buffer full
+
+
+def _log_filter(level, read_fd, out_fd):
+    """Reads everything native code writes to stderr and passes on what `level` allows."""
+    dropped, last_report = 0, time.monotonic()
+    # Qt's startup banner (GL type, Init Parameters) is information, not an error:
+    # skip from "qt.webenginecontext:" to the blank line after the parameter list.
+    banner, banner_lines, in_params = False, 0, False
+    with os.fdopen(read_fd, "rb", buffering=0) as pipe:
+        for line in iter(pipe.readline, b""):
+            show = True
+            if line.startswith(b"qt.webenginecontext:"):
+                banner, banner_lines, in_params = True, 0, False
+            if banner:
+                banner_lines += 1
+                if line.startswith(b"Init Parameters"):
+                    in_params = True
+                elif (in_params and not line.strip()) or banner_lines > 60:
+                    banner = False
+                continue
+            m = CHROMIUM_LINE.match(line)
+            if level == "none":
+                show = False
+            elif m and level == "fatal":
+                show = m.group(1) == b"FATAL"
+            elif m:
+                src, msg = m.group(2), m.group(3)
+                if src == UDP_FULL[0] and UDP_FULL[1] in msg:
+                    dropped += 1
+                    show = False
+                    now = time.monotonic()
+                    if now - last_report >= 60:
+                        line = (f"multiview: WebRTC: {dropped} outgoing UDP packets dropped "
+                                f"(send buffer full) in the last {int(now - last_report)} s - a page is "
+                                "sending peer-to-peer traffic. webrtc = off stops it.\n").encode()
+                        dropped, last_report, show = 0, now, True
+                elif any(src == f and t in msg for f, t in HARMLESS):
+                    show = False
+            if show:
+                try:
+                    os.write(out_fd, line)
+                except OSError:
+                    pass
+
+
+def setup_logging():
+    """Apply log_level. Must run before Qt starts (it sets Chromium flags / env)."""
+    level = LOG_LEVELS.get(OPTS["log_level"])
+    if level is None:
+        print(f"multiview: unknown log_level '{OPTS['log_level']}' - using all "
+              f"(choose: all, important, fatal, none)")
+        level = "all"
+    if VERBOSE:
+        level = "all"                       # -v means "show me everything"
+    if level == "all":
+        return
+    if level in ("fatal", "none"):
+        add_chromium_flag("--log-level=3")  # Chromium: 0 info, 1 warning, 2 error, 3 fatal
+    # Route native stderr (Qt, Chromium and its child processes) through a filter.
+    # Python's own messages (tracebacks) go straight to the real stderr.
+    real = os.dup(2)
+    sys.stderr.flush()
+    sys.stderr = os.fdopen(os.dup(real), "w", buffering=1, errors="replace")
+    read_fd, write_fd = os.pipe()
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+    threading.Thread(target=_log_filter, args=(level, read_fd, real), daemon=True).start()
+
+
+def add_chromium_flag(flag):
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    key = flag.split("=", 1)[0]
+    if key not in flags:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{flags} {flag}".strip()
 
 
 # --------------------------------------------------------------------------- ad blocking
@@ -501,6 +626,19 @@ POPUP_STUB_JS = r"""
 })();
 """
 
+# webrtc = off: runs in every frame before the page's own scripts and removes the
+# peer-to-peer API, so P2P video-sharing scripts see "no WebRTC" and fall back to
+# plain HTTP. (The engine is also told not to send UDP, in case a page gets around it.)
+NO_WEBRTC_JS = r"""
+(() => {
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel',
+                      'RTCSessionDescription', 'RTCIceCandidate']) {
+    try { Object.defineProperty(window, name, { value: undefined, writable: false,
+                                                configurable: false }); } catch (e) {}
+  }
+})();
+"""
+
 # Adds/updates a <style> block and returns the page's class and id names
 # so generic cosmetic rules can be matched against them.
 COSMETIC_JS = r"""
@@ -680,6 +818,14 @@ if HAVE_WEB:
                 s.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
                 s.setRunsOnSubFrames(True)
                 _PROFILE.scripts().insert(s)
+            if not OPTS["webrtc"]:
+                w = QWebEngineScript()
+                w.setName("mv-no-webrtc")
+                w.setSourceCode(NO_WEBRTC_JS)
+                w.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+                w.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+                w.setRunsOnSubFrames(True)
+                _PROFILE.scripts().insert(w)
         return _PROFILE
 
 
@@ -1426,9 +1572,16 @@ def main():
     if "-h" in sys.argv or "--help" in sys.argv:
         print(__doc__)
         return
+    setup_logging()
     install_terminal_quit()
     if HAVE_WEB and any(not is_media(s) for s in SOURCES):
         enable_widevine()
+        if not OPTS["webrtc"]:
+            # No UDP unless through a proxy (there is none) -> no peer-to-peer traffic,
+            # and the page script below removes the WebRTC API itself.
+            add_chromium_flag("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+            print("multiview: WebRTC off (web feeds can't open peer-to-peer connections;\n"
+                  "           if a feed won't play, try webrtc = on in multiview.ini or --webrtc)")
     # Name the app "multiview" in the taskbar / dock instead of "python3":
     # Wayland uses the desktop file name as the app_id, X11 uses the app name
     # for WM_CLASS.
