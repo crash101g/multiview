@@ -157,7 +157,28 @@ block_popups = yes     ; drop pop-up / new-window ads
 adblock = yes          ; uBlock Origin / EasyList filtering
 lock_navigation = yes  ; stop ads redirecting a feed to another site
 extra_lists =          ; more filter-list URLs, comma separated
+log_level = important  ; terminal noise: all, important, fatal (or critical), none
+webrtc = off           ; on = allow web feeds to open peer-to-peer connections
 ```
+
+### Terminal logs
+
+The browser engine (Chromium) prints a lot of `ERROR` lines that are harmless: D-Bus being blocked by the sandbox, WebRTC `.local` names, STUN timeouts, data channels closing. `log_level` (or `--logs=LEVEL` for one run) controls how much of it you see. multiview's own `multiview: ...` messages always show.
+
+| `log_level` | Shows |
+| --- | --- |
+| `all` | everything, including Qt's startup banner |
+| `important` (default) | real errors only. Known-harmless lines and the startup banner are hidden; dropped WebRTC upload packets (`error 11`) are summed up once a minute |
+| `fatal` / `critical` | only crashes (Chromium `FATAL`) |
+| `none` | nothing from the browser engine |
+
+`-v` always shows everything.
+
+### WebRTC
+
+WebRTC is **off by default**. Some streaming sites use it to share video between viewers peer-to-peer, which uses your upload bandwidth and can reveal your IP address to other viewers. With it off, multiview removes the WebRTC API from every page and frame and stops the engine sending UDP, so those sites fall back to normal downloads. Cameras (mpv) aren't affected.
+
+If a web feed won't play, it may genuinely need WebRTC. Turn it back on with `webrtc = on` in `multiview.ini`, or for one run with `--webrtc`. (`--no-webrtc` forces it off for one run when the ini says `on`.)
 
 ### Ad blocking details
 
