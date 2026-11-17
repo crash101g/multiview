@@ -36,6 +36,9 @@ Usage:
   ./multiview.py --webrtc ...         # allow WebRTC peer-to-peer in web feeds this run (off by default;
                                       #   also: webrtc = on). --no-webrtc forces it off
   ./multiview.py --auto-reload ...    # reload web feeds that never start playing (also: auto_reload = yes)
+  ./multiview.py --mpv-process ...    # cameras through a separate mpv (needs X11) for this run
+                                      #   (default: libmpv when python-mpv is installed;
+                                      #   also: camera_player = mpv | libmpv | auto)
 
 Sandbox: multiview restarts itself inside an OS sandbox (bubblewrap on Linux,
 sandbox-exec on macOS - see multiview-sandbox.sh) so a hostile web page that
@@ -159,6 +162,12 @@ webrtc = off
 auto_reload = no
 auto_reload_after = 20
 auto_reload_tries = 3
+; how rtsp/rtsps cameras play: libmpv = mpv inside multiview (pip install
+; python-mpv), mpv = a separate mpv drawing into the tile (needs X11),
+; auto = libmpv if python-mpv is installed, else mpv. With libmpv on a Wayland
+; desktop and no VLC feeds, the sandbox runs WITHOUT X11 access, so a hostile
+; page couldn't read your clipboard or keystrokes in other apps.
+camera_player = auto
 """
 
 DEFAULT_MY_FILTERS = """\
@@ -244,10 +253,6 @@ def enter_sandbox():
         MY_FILTERS.write_text(DEFAULT_MY_FILTERS)
     sys.stdout.flush()
     os.execv("/bin/bash", ["/bin/bash", str(SANDBOX_LAUNCHER)] + sys.argv[1:])
-
-
-if __name__ == "__main__":
-    enter_sandbox()
 
 
 # --------------------------------------------------------------------------- input helpers
@@ -339,6 +344,7 @@ def load_config():
         "auto_reload": cfg.getboolean("options", "auto_reload", fallback=False),
         "auto_reload_after": max(5.0, cfg.getfloat("options", "auto_reload_after", fallback=20.0)),
         "auto_reload_tries": max(1, cfg.getint("options", "auto_reload_tries", fallback=3)),
+        "camera_player": cfg.get("options", "camera_player", fallback="auto").strip().lower(),
     }
     return [f for f in feeds if f], opts
 
@@ -372,10 +378,97 @@ if "--auto-reload" in sys.argv:
     OPTS["auto_reload"] = True
 # Watch for playing video when either feature needs to know.
 OPTS["watch_play"] = OPTS["auto_reload"] or OPTS["stagger_auto"]
+if "--libmpv" in sys.argv:
+    OPTS["camera_player"] = "libmpv"
+if "--mpv-process" in sys.argv:
+    OPTS["camera_player"] = "mpv"
 SOURCES = [fix_camera_url(s) for s in (_cli or _ini_feeds)[:4]]
 
-if any(is_media(s) for s in SOURCES) and sys.platform.startswith("linux"):
+# How camera feeds run mpv:
+#   process - a separate mpv drawing into the tile with --wid (Linux/X11; tested, default)
+#   lib     - libmpv inside multiview, drawing into an OpenGL widget (pip install python-mpv).
+#             Always on macOS, where a separate process can't draw into our window; on
+#             Linux with camera_player = libmpv, so nothing needs X11.
+def _have_libmpv():
+    try:
+        import mpv  # noqa: F401  (python-mpv; loads libmpv)
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def _mpv_mode():
+    choice = OPTS["camera_player"]
+    if sys.platform == "darwin" or choice in ("libmpv", "lib"):
+        return "lib"
+    if choice in ("mpv", "process"):
+        return "process"
+    if choice != "auto":
+        print(f"multiview: unknown camera_player '{choice}' - using auto (choose: auto, libmpv, mpv)")
+    return "lib" if _have_libmpv() else "process"
+
+
+MPV_MODE = os.environ.get("MULTIVIEW_MPV") or _mpv_mode()
+
+
+def _needs_x11(url):
+    """VLC and the mpv process (--wid) can only draw into an X11 window."""
+    return is_media(url) and not (is_camera(url) and MPV_MODE == "lib")
+
+
+LINUX = sys.platform.startswith("linux")
+NEED_X11 = LINUX and any(_needs_x11(s) for s in SOURCES)
+# Run without X11 at all: only when asked for (libmpv cameras), on a Wayland desktop,
+# and when no feed needs X11. Qt then runs natively on Wayland and the sandbox gets
+# no X11 access (socket files hidden + Landlock blocks the abstract X socket).
+NO_X11 = (LINUX and MPV_MODE == "lib" and not NEED_X11
+          and bool(os.environ.get("WAYLAND_DISPLAY")))
+if NEED_X11:
+    # Pop!_OS COSMIC etc. are Wayland: run Qt through XWayland so VLC/mpv can embed.
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    if MPV_MODE == "lib" and SANDBOX_STATE != "on":
+        print("multiview: a VLC feed needs X11 - keeping X11 access for this run")
+elif NO_X11:
+    os.environ["MULTIVIEW_NO_X11"] = "1"            # tells multiview-sandbox.sh
+    os.environ["QT_QPA_PLATFORM"] = "wayland"
+    os.environ.pop("DISPLAY", None)                 # nothing in here should try X11
+    os.environ.pop("XAUTHORITY", None)
+
+
+def block_abstract_sockets():
+    """Landlock (Linux 6.12+): stop this process and its children from connecting to
+    abstract unix sockets created outside the sandbox - X11 listens on one
+    (@/tmp/.X11-unix/X0), which hiding the socket files can't cover while the
+    sandbox shares the network. Must run before any thread starts."""
+    import ctypes
+    import struct
+    libc = ctypes.CDLL(None, use_errno=True)
+    abi = libc.syscall(444, None, 0, 1)             # landlock_create_ruleset(VERSION)
+    if abi < 6:
+        return "Landlock abstract-socket scoping needs Linux 6.12+"
+    attr = struct.pack("QQQ", 0, 0, 1)              # fs, net, scoped = ABSTRACT_UNIX_SOCKET
+    buf = ctypes.create_string_buffer(attr, len(attr))
+    fd = libc.syscall(444, buf, len(attr), 0)
+    if fd < 0:
+        return f"landlock_create_ruleset: {os.strerror(ctypes.get_errno())}"
+    try:
+        if libc.prctl(38, 1, 0, 0, 0) != 0:         # PR_SET_NO_NEW_PRIVS (required)
+            return f"no_new_privs: {os.strerror(ctypes.get_errno())}"
+        if libc.syscall(446, fd, 0) != 0:           # landlock_restrict_self
+            return f"landlock_restrict_self: {os.strerror(ctypes.get_errno())}"
+    finally:
+        os.close(fd)
+    return None
+
+
+if __name__ == "__main__":
+    enter_sandbox()
+    if NO_X11 and SANDBOX_STATE == "on":
+        _problem = block_abstract_sockets()
+        if _problem:
+            print(f"multiview: WARNING - X11 is only partly closed off ({_problem})")
+        else:
+            print("multiview: no X11 access (cameras through libmpv, Wayland only)")
 
 
 # --------------------------------------------------------------------------- terminal logs
@@ -392,6 +485,11 @@ HARMLESS = [
     (b"stun_port.cc", b"Binding request timed out"),        # mostly IPv6 with no IPv6 route
 ]
 UDP_FULL = (b"stun_port.cc", b"failed with error 11")      # EAGAIN: outgoing UDP buffer full
+# Known-harmless lines from other libraries (hidden at important and fatal)
+HARMLESS_TEXT = [
+    b"Cannot load libcuda.so",            # libmpv probing NVIDIA decoding on a non-NVIDIA PC
+    b"client-rt.conf is deprecated",      # PipeWire client library config-name notice
+]
 
 
 def _log_filter(level, read_fd, out_fd):
@@ -414,6 +512,8 @@ def _log_filter(level, read_fd, out_fd):
                 continue
             m = CHROMIUM_LINE.match(line)
             if level == "none":
+                show = False
+            elif not m and any(t in line for t in HARMLESS_TEXT):
                 show = False
             elif m and level == "fatal":
                 show = m.group(1) == b"FATAL"
@@ -631,11 +731,6 @@ import shutil                                                                   
 import socket                                                                              # noqa: E402
 import tempfile                                                                            # noqa: E402
 HAVE_MPV = shutil.which("mpv") is not None
-# How camera feeds run mpv:
-#   process - a separate mpv drawing into the tile with --wid (Linux/X11; tested, default)
-#   lib     - libmpv inside multiview, drawing into an OpenGL widget. Needed on macOS,
-#             where a separate process can't draw into our window. pip install python-mpv
-MPV_MODE = os.environ.get("MULTIVIEW_MPV", "lib" if sys.platform == "darwin" else "process")
 
 
 # --------------------------------------------------------------------------- web plumbing

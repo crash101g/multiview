@@ -55,8 +55,6 @@ Linux)
         --ro-bind "$HERE" "$HERE"
         # ad-block list cache: the only writable place that survives
         --bind "$CACHE" "$CACHE"
-        # display: X11 (Qt + mpv use it) and Wayland
-        --ro-bind-try /tmp/.X11-unix /tmp/.X11-unix
         # audio
         --ro-bind-try "$RUNDIR/pipewire-0" "$RUNDIR/pipewire-0"
         --ro-bind-try "$RUNDIR/pulse/native" "$RUNDIR/pulse/native"
@@ -70,11 +68,19 @@ Linux)
         --unsetenv SESSION_MANAGER
         --chdir "$HERE"
     )
+    # display: Wayland, plus X11 unless multiview says nothing needs it
+    # (camera_player = libmpv, no VLC feeds). Without X11, multiview.py also uses
+    # Landlock to block X11's abstract socket, which bwrap can't hide here.
     [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$RUNDIR/$WAYLAND_DISPLAY" ] &&
         args+=(--ro-bind "$RUNDIR/$WAYLAND_DISPLAY" "$RUNDIR/$WAYLAND_DISPLAY")
-    [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ] &&
-        args+=(--ro-bind "$XAUTHORITY" "$XAUTHORITY")
-    [ -f "$HOME/.Xauthority" ] && args+=(--ro-bind "$HOME/.Xauthority" "$HOME/.Xauthority")
+    if [ "${MULTIVIEW_NO_X11:-}" = 1 ]; then
+        args+=(--unsetenv DISPLAY --unsetenv XAUTHORITY --setenv QT_QPA_PLATFORM wayland)
+    else
+        args+=(--ro-bind-try /tmp/.X11-unix /tmp/.X11-unix)
+        [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ] &&
+            args+=(--ro-bind "$XAUTHORITY" "$XAUTHORITY")
+        [ -f "$HOME/.Xauthority" ] && args+=(--ro-bind "$HOME/.Xauthority" "$HOME/.Xauthority")
+    fi
 
     # pip --user packages (the "adblock" engine), read-only
     pyuser="$(python3 -c 'import site; print(site.getusersitepackages())' 2>/dev/null || true)"
