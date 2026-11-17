@@ -65,21 +65,40 @@ Started from the launcher, multiview plays the feeds listed under `[feeds]` in `
 
 ```bash
 brew install python
-brew install --cask vlc                                  # only for rtsp/m3u8/etc. feeds
+brew install mpv                                         # only for rtsp/rtsps cameras (provides libmpv)
+brew install --cask vlc                                  # only for m3u8/ts/etc. feeds
 
 git clone https://github.com/crash101g/multiview.git
 cd multiview
 python3 -m venv .venv
 source .venv/bin/activate
-pip install PyQt6 PyQt6-WebEngine adblock python-vlc
-chmod +x multiview.py
+pip install PyQt6 PyQt6-WebEngine adblock python-vlc python-mpv
+chmod +x multiview.py multiview-sandbox.sh
 ```
 
-Run `source .venv/bin/activate` in each new terminal before starting multiview. python-vlc finds VLC in `/Applications/VLC.app`. Use `Ctrl`+`Cmd`+`F` for fullscreen, because macOS keeps `F11` for Show Desktop. Web feeds should work as they do on Linux. Direct streams through VLC haven't been tested on a Mac yet.
+Run `source .venv/bin/activate` in each new terminal before starting multiview. python-vlc finds VLC in `/Applications/VLC.app`. Use `Ctrl`+`Cmd`+`F` for fullscreen, because macOS keeps `F11` for Show Desktop.
+
+On macOS, cameras play through libmpv *inside* multiview (a separate mpv process can't draw into another app's window there), with the same settings and reconnect rules as on Linux. If libmpv isn't found, point python-mpv at Homebrew's copy: `export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib`.
+
+**macOS hasn't been tested yet.** Things to check on a first run:
+- **Codecs:** the pip `PyQt6-WebEngine` build usually leaves out H.264/AAC, so web players that use them may stay blank. Cameras (mpv) and VLC feeds aren't affected.
+- **Widevine:** multiview looks for the copy inside Chrome/Edge/Brave in `/Applications` and in `~/Library/Application Support`. Many DRM services also check the browser itself, so protected streams may still refuse to play.
 
 **Windows:** `pip install PyQt6 PyQt6-WebEngine adblock python-vlc` (plus VLC itself for direct streams). This should work but hasn't been tested.
 
 Linux is the only platform multiview has been tested on so far.
+
+## Sandboxed launch (recommended for web feeds)
+
+`multiview-sandbox.sh` runs multiview inside an OS sandbox. The feeds play exactly the same; the sandbox only limits what the app can see. If a malicious page on an embed site ever broke out of the browser engine, it would land in a box with no access to the rest of your home folder (`~/.ssh`, browser logins, documents), no way to rewrite multiview's own files, and no access to your desktop session bus.
+
+```bash
+./multiview-sandbox.sh                 # same arguments as multiview.py
+```
+
+- **Linux** uses [bubblewrap](https://github.com/containers/bubblewrap) (`sudo apt install bubblewrap`). The app sees a throw-away home folder, its own folder read-only, the ad-block list cache, and read-only copies of Widevine and pip `--user` packages. Display (X11/Wayland), audio (PipeWire/Pulse), GPU and network work as normal. Chromium's own sandbox still runs inside it, so web pages are boxed twice. Menu entry: `sed "s|@DIR@|$PWD|g" multiview-sandbox.desktop > ~/.local/share/applications/multiview-sandbox.desktop`
+- **macOS** uses the built-in `sandbox-exec` with `multiview.sb` (blocks your home folder except the files multiview needs, and blocks AppleScript control of other apps). Apple labels `sandbox-exec` deprecated, but it is the same sandbox engine macOS and Chrome rely on. Untested so far: if web tiles stay blank inside it, Chromium's own sandbox may not start inside another one. Try `QTWEBENGINE_DISABLE_SANDBOX=1 ./multiview-sandbox.sh`, which keeps the outer sandbox only.
+- What it can't stop: the app still needs the network, so a compromised page could still reach other devices on your LAN. Camera passwords in `multiview.ini` are inside the box, because the app needs them.
 
 ## Use
 
