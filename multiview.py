@@ -1034,6 +1034,7 @@ def libmpv_tile_class():
         hint = ("brew install mpv && pip install python-mpv" if sys.platform == "darwin"
                 else "sudo apt install libmpv2 && pip install --user --break-system-packages python-mpv")
         raise RuntimeError(f"libmpv / python-mpv is not available ({e}). Install: {hint}") from e
+    import locale
     from PyQt6.QtCore import pyqtSignal
     from PyQt6.QtGui import QOpenGLContext
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -1065,6 +1066,9 @@ def libmpv_tile_class():
             self.stopping, self.saw_401, self.first = False, False, True
             self.retry_s, self.started_at = 5, 0.0
             self.ctx = None
+            # libmpv refuses to start (and python-mpv then crashes) unless numbers are
+            # formatted the C way. Qt resets the locale when it starts, so set it here.
+            locale.setlocale(locale.LC_NUMERIC, "C")
             self.player = mpv.MPV(
                 vo="libmpv", log_handler=self._log, loglevel="warn",
                 profile="low-latency", hwdec="auto-safe", keep_open="no", idle="yes",
