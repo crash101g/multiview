@@ -46,6 +46,8 @@ The banners, sidebars and the fake "update your player" box are removed by the s
 sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine bubblewrap
 pip install --user --break-system-packages adblock      # Brave's engine (recommended)
 sudo apt install mpv                                     # only for rtsp/rtsps cameras
+# recommended: cameras through libmpv, so the sandbox can run without X11 (see Sandbox)
+sudo apt install libmpv2 && pip install --user --break-system-packages python-mpv
 sudo apt install vlc python3-vlc                         # only for m3u8/ts/etc. feeds
 
 git clone https://github.com/crash101g/multiview.git
@@ -106,6 +108,22 @@ The window title tells you which mode you're in: `multiview - 4 feeds` is sandbo
 - **Linux** uses [bubblewrap](https://github.com/containers/bubblewrap) (`sudo apt install bubblewrap`). The app sees a throw-away home folder, its own folder read-only, the ad-block list cache, and read-only copies of Widevine and pip `--user` packages. Display (X11/Wayland), audio (PipeWire/Pulse), GPU and network work as normal. Chromium's own sandbox still runs inside it, so web pages are boxed twice.
 - **macOS** uses the built-in `sandbox-exec` with `multiview.sb` (blocks your home folder except the files multiview needs, and blocks AppleScript control of other apps). Apple labels `sandbox-exec` deprecated, but it is the same sandbox engine macOS and Chrome rely on. Untested so far: if web tiles stay blank inside it, Chromium's own sandbox may not start inside another one. Try `QTWEBENGINE_DISABLE_SANDBOX=1 ./multiview.py`, which keeps the outer sandbox only.
 - What it can't stop: the app still needs the network, so a compromised page could still reach other devices on your LAN. Camera passwords in `multiview.ini` are inside the box, because the app needs them.
+
+### No X11 access: cameras through libmpv
+
+A camera tile can run a separate `mpv` that draws into the tile through X11, which means the sandbox has to let the app reach your X server. Anything that can talk to X11 can read the clipboard, see keys typed into other X11 apps, and send keystrokes to other windows. That's the biggest remaining hole in the sandbox.
+
+So when `python-mpv` is installed, cameras play through mpv *inside* multiview instead (`camera_player = auto`, the default). On a Wayland desktop, when no feed needs VLC, multiview then:
+
+- runs natively on Wayland, with no `DISPLAY`;
+- gives the sandbox no X11 socket files;
+- uses Landlock (Linux 6.12+) to block X11's *abstract* socket. bwrap can't hide that socket while the network is shared, and many X servers accept it without a cookie.
+
+The terminal then says `multiview: no X11 access (cameras through libmpv, Wayland only)`. This applies to web-only sessions too.
+
+- Without `python-mpv` installed, cameras use the separate `mpv` and X11 stays available, as before.
+- `camera_player = mpv` (or `--mpv-process` for one run) chooses the old way on purpose; `camera_player = libmpv` insists on libmpv.
+- If a VLC feed is open, X11 stays on for that run.
 
 ## Use
 
