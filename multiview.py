@@ -31,6 +31,12 @@ Usage:
   ./multiview.py --update-filters ... # force a fresh download of the lists
   ./multiview.py --no-adblock ...     # turn blocking off for this run
   ./multiview.py -v ...               # print every blocked request (handy for my-filters.txt)
+  ./multiview.py --no-sandbox ...     # run without the OS sandbox (also: sandbox = no in multiview.ini)
+
+Sandbox: multiview restarts itself inside an OS sandbox (bubblewrap on Linux,
+sandbox-exec on macOS - see multiview-sandbox.sh) so a hostile web page that
+broke out of the browser engine still couldn't reach the rest of your files.
+If the sandbox can't start, multiview says so and runs without it.
 
 Keys:
   click    click a feed to hear it (others are muted; all start muted)
@@ -126,6 +132,8 @@ widevine = auto
 ; seconds between starting each web feed (and between reloads with Shift+R),
 ; so the site isn't hit with every stream/license request at once. 0 = all at once
 stagger = 3
+; run inside the OS sandbox (bubblewrap / sandbox-exec). no = run unsandboxed
+sandbox = yes
 """
 
 DEFAULT_MY_FILTERS = """\
@@ -135,6 +143,70 @@ DEFAULT_MY_FILTERS = """\
 !   example.com##.overlay-ad         hide an element on one site
 !   @@||cdn-i-need.com^              never block this domain
 """
+
+
+# --------------------------------------------------------------------------- sandbox
+SANDBOX_LAUNCHER = HERE / "multiview-sandbox.sh"
+
+
+def _sandbox_wanted():
+    if os.environ.get("MULTIVIEW_SANDBOXED") == "1":         # already inside
+        return False
+    if "--no-sandbox" in sys.argv or "-h" in sys.argv or "--help" in sys.argv:
+        return False
+    cfg = configparser.ConfigParser(interpolation=None)
+    try:
+        cfg.read(INI)
+        return cfg.getboolean("options", "sandbox", fallback=True)
+    except (configparser.Error, ValueError):
+        return True
+
+
+def _sandbox_works():
+    """Quick check that the sandbox tool exists and can actually start here."""
+    import shutil
+    import subprocess
+    if not SANDBOX_LAUNCHER.exists():
+        return f"{SANDBOX_LAUNCHER.name} is missing"
+    if sys.platform.startswith("linux"):
+        if not shutil.which("bwrap"):
+            return "bwrap is not installed (sudo apt install bubblewrap)"
+        probe = ["bwrap", "--unshare-all", "--ro-bind", "/", "/", "true"]
+    elif sys.platform == "darwin":
+        if not shutil.which("sandbox-exec"):
+            return "sandbox-exec is not available"
+        probe = ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"]
+    else:
+        return f"no sandbox support on {sys.platform}"
+    try:
+        if subprocess.run(probe, capture_output=True, timeout=10).returncode != 0:
+            return "the sandbox failed to start on this system"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"the sandbox failed to start ({e})"
+    return None
+
+
+def enter_sandbox():
+    """Restart multiview inside the OS sandbox unless told not to."""
+    if not _sandbox_wanted():
+        return
+    problem = _sandbox_works()
+    if problem:
+        print(f"multiview: WARNING - running WITHOUT the sandbox: {problem}\n"
+              "           (use --no-sandbox or sandbox = no in multiview.ini to hide this)")
+        return
+    # Inside the sandbox multiview's folder is read-only: create first-run files now.
+    if not INI.exists():
+        INI.write_text(DEFAULT_INI)
+        INI.chmod(0o600)                    # it will hold camera passwords
+    if not MY_FILTERS.exists():
+        MY_FILTERS.write_text(DEFAULT_MY_FILTERS)
+    sys.stdout.flush()
+    os.execv("/bin/bash", ["/bin/bash", str(SANDBOX_LAUNCHER)] + sys.argv[1:])
+
+
+if __name__ == "__main__":
+    enter_sandbox()
 
 
 # --------------------------------------------------------------------------- input helpers

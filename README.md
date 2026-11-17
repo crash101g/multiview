@@ -43,7 +43,7 @@ The banners, sidebars and the fake "update your player" box are removed by the s
 **Ubuntu / Pop!_OS / Debian**
 
 ```bash
-sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
+sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine bubblewrap
 pip install --user --break-system-packages adblock      # Brave's engine (recommended)
 sudo apt install mpv                                     # only for rtsp/rtsps cameras
 sudo apt install vlc python3-vlc                         # only for m3u8/ts/etc. feeds
@@ -57,6 +57,8 @@ To give multiview its own name and icon in the taskbar and app launcher, install
 
 ```bash
 sed "s|@DIR@|$PWD|g" multiview.desktop > ~/.local/share/applications/multiview.desktop
+# optional: a second entry that runs without the sandbox, as a fallback
+sed "s|@DIR@|$PWD|g" multiview-non-sandboxed.desktop > ~/.local/share/applications/multiview-non-sandboxed.desktop
 ```
 
 Started from the launcher, multiview plays the feeds listed under `[feeds]` in `multiview.ini`. If you move the folder, run the command again.
@@ -88,16 +90,19 @@ On macOS, cameras play through libmpv *inside* multiview (a separate mpv process
 
 Linux is the only platform multiview has been tested on so far.
 
-## Sandboxed launch (recommended for web feeds)
+## Sandbox (on by default)
 
-`multiview-sandbox.sh` runs multiview inside an OS sandbox. The feeds play exactly the same; the sandbox only limits what the app can see. If a malicious page on an embed site ever broke out of the browser engine, it would land in a box with no access to the rest of your home folder (`~/.ssh`, browser logins, documents), no way to rewrite multiview's own files, and no access to your desktop session bus.
+multiview restarts itself inside an OS sandbox every time it starts (via `multiview-sandbox.sh`). The feeds play exactly the same; the sandbox only limits what the app can see. If a malicious page on an embed site ever broke out of the browser engine, it would land in a box with no access to the rest of your home folder (`~/.ssh`, browser logins, documents), no way to rewrite multiview's own files, and no access to your desktop session bus.
 
 ```bash
-./multiview-sandbox.sh                 # same arguments as multiview.py
+./multiview.py                 # sandboxed (default)
+./multiview.py --no-sandbox    # fallback: run without the sandbox
 ```
 
-- **Linux** uses [bubblewrap](https://github.com/containers/bubblewrap) (`sudo apt install bubblewrap`). The app sees a throw-away home folder, its own folder read-only, the ad-block list cache, and read-only copies of Widevine and pip `--user` packages. Display (X11/Wayland), audio (PipeWire/Pulse), GPU and network work as normal. Chromium's own sandbox still runs inside it, so web pages are boxed twice. Menu entry: `sed "s|@DIR@|$PWD|g" multiview-sandbox.desktop > ~/.local/share/applications/multiview-sandbox.desktop`
-- **macOS** uses the built-in `sandbox-exec` with `multiview.sb` (blocks your home folder except the files multiview needs, and blocks AppleScript control of other apps). Apple labels `sandbox-exec` deprecated, but it is the same sandbox engine macOS and Chrome rely on. Untested so far: if web tiles stay blank inside it, Chromium's own sandbox may not start inside another one. Try `QTWEBENGINE_DISABLE_SANDBOX=1 ./multiview-sandbox.sh`, which keeps the outer sandbox only.
+To turn it off permanently, set `sandbox = no` under `[options]` in `multiview.ini`. If the sandbox can't start (for example bubblewrap isn't installed), multiview prints a warning and runs without it, so your feeds still come up.
+
+- **Linux** uses [bubblewrap](https://github.com/containers/bubblewrap) (`sudo apt install bubblewrap`). The app sees a throw-away home folder, its own folder read-only, the ad-block list cache, and read-only copies of Widevine and pip `--user` packages. Display (X11/Wayland), audio (PipeWire/Pulse), GPU and network work as normal. Chromium's own sandbox still runs inside it, so web pages are boxed twice.
+- **macOS** uses the built-in `sandbox-exec` with `multiview.sb` (blocks your home folder except the files multiview needs, and blocks AppleScript control of other apps). Apple labels `sandbox-exec` deprecated, but it is the same sandbox engine macOS and Chrome rely on. Untested so far: if web tiles stay blank inside it, Chromium's own sandbox may not start inside another one. Try `QTWEBENGINE_DISABLE_SANDBOX=1 ./multiview.py`, which keeps the outer sandbox only.
 - What it can't stop: the app still needs the network, so a compromised page could still reach other devices on your LAN. Camera passwords in `multiview.ini` are inside the box, because the app needs them.
 
 ## Use

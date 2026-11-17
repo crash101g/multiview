@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=multiview (sandboxed)
-Comment=multiview inside a bubblewrap sandbox - no access to the rest of your home folder
+Name=multiview (non-sandboxed)
+Comment=multiview without the OS sandbox - fallback if a feed won't play sandboxed
 # @DIR@ is replaced with the folder you cloned multiview into (see README)
-Exec=@DIR@/multiview-sandbox.sh
+Exec=@DIR@/multiview.py --no-sandbox
 Path=@DIR@
 Icon=video-display
 Terminal=false
