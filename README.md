@@ -159,6 +159,7 @@ lock_navigation = yes  ; stop ads redirecting a feed to another site
 extra_lists =          ; more filter-list URLs, comma separated
 log_level = important  ; terminal noise: all, important, fatal (or critical), none
 webrtc = off           ; on = allow web feeds to open peer-to-peer connections
+auto_reload = no       ; yes = reload web feeds that never start playing
 ```
 
 ### Terminal logs
@@ -179,6 +180,22 @@ The browser engine (Chromium) prints a lot of `ERROR` lines that are harmless: D
 WebRTC is **off by default**. Some streaming sites use it to share video between viewers peer-to-peer, which uses your upload bandwidth and can reveal your IP address to other viewers. With it off, multiview removes the WebRTC API from every page and frame and stops the engine sending UDP, so those sites fall back to normal downloads. Cameras (mpv) aren't affected.
 
 If a web feed won't play, it may genuinely need WebRTC. Turn it back on with `webrtc = on` in `multiview.ini`, or for one run with `--webrtc`. (`--no-webrtc` forces it off for one run when the ini says `on`.)
+
+### One feed at a time (`stagger = auto`, optional)
+
+Many stream sites fail when several players start at the same moment, but work when they start one after another. `stagger` sets the gap between starting each web feed (default 3 seconds). With `stagger = auto`, multiview starts the next web feed as soon as the previous one is actually playing. If a feed hasn't started after `auto_reload_after` seconds (default 20), it moves on to the next one. Shift+R reloads all feeds the same way, one at a time. If you'd rather have a fixed gap, a larger number such as `stagger = 20` also works.
+
+### Auto-reload (optional, off by default)
+
+Some stream sites don't start every time, and the feed has to be reloaded once or twice. With `auto_reload = yes` (or `--auto-reload` for one run), multiview watches each web feed. If no video has started playing after `auto_reload_after` seconds (default 20), it reloads that feed and prints a line saying so. It also prints when each feed starts playing (`feed 2 playing (12 s after loading, ...)`) and when you reload one by hand, so the terminal shows what happened to each feed. The wait gets longer with each try (20 s, 40 s, 60 s ...), and after `auto_reload_tries` reloads (default 3) it stops and leaves the feed for you to reload with R. Pressing R yourself starts the count over. Automatic reloads take turns: only one feed (re)loads at a time, so the site is never hit by several at once.
+
+```ini
+auto_reload = yes
+auto_reload_after = 20
+auto_reload_tries = 3
+```
+
+Only feeds that have **never** started are touched. A feed that has played, even if it's now paused or buffering, is left alone. Videos inside embedded player frames from other sites are detected too. Cameras already reconnect on their own.
 
 ### Ad blocking details
 
