@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=multiview (sandboxed)
+Comment=multiview inside a bubblewrap sandbox - no access to the rest of your home folder
+# @DIR@ is replaced with the folder you cloned multiview into (see README)
+Exec=@DIR@/multiview-sandbox.sh
+Path=@DIR@
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;Player;
+StartupWMClass=multiview

@@ -1,0 +1,47 @@
+;; SPDX-License-Identifier: GPL-3.0-only
+;; multiview.sb - macOS sandbox profile for multiview, used by multiview-sandbox.sh
+;; (sandbox-exec -f multiview.sb -D HOME=... -D HERE=... ...).
+;;
+;; Goal: if a malicious web page broke out of the browser engine, it could not
+;; read or change anything in your home folder (documents, ~/.ssh, browser
+;; logins, keychain files ...), could not rewrite multiview itself, and could
+;; not script other apps.  Everything else (display, audio, GPU, network) works
+;; as normal, so feeds play exactly as they do outside the sandbox.
+;;
+;; Rules later in the file win over earlier ones.
+
+(version 1)
+(allow default)
+
+(define (home rel) (string-append (param "HOME") rel))
+
+;; ---- 1. nothing in your home folder ...
+;; (file *names* and sizes stay visible so Python/Qt can find their way;
+;;  file *contents* and folder listings do not)
+(deny file-read-data file-read-xattr file-write* (subpath (param "HOME")))
+
+;; ---- 2. ... except what multiview needs
+;; multiview's own folder: read-only (also when it lives outside your home)
+(allow file-read* (subpath (param "HERE")))
+(deny file-write* (subpath (param "HERE")))
+
+;; ad-block list cache (~/Library/Caches/multiview) - the only writable place
+(allow file-read* file-write* (subpath (param "CACHE")))
+
+;; Python, PyQt6, python-mpv ... (venv, pyenv or pip --user installs in your home)
+(allow file-read*
+       (subpath (param "PY_PREFIX"))
+       (subpath (param "PY_BASE"))
+       (subpath (param "PY_USER")))
+
+;; Widevine (DRM) copies kept by Chrome / Edge / Brave ... in their profile folders
+(allow file-read* (regex #"^/Users/[^/]+/Library/Application Support/.+/WidevineCdm/"))
+
+;; your own fonts and macOS's per-user text settings
+(allow file-read*
+       (subpath (home "/Library/Fonts"))
+       (literal (home "/.CFUserTextEncoding")))
+
+;; ---- 3. no controlling other apps (AppleScript / Apple Events can run commands
+;;         in Terminal etc., which would be outside this sandbox)
+(deny appleevent-send)

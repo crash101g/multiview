@@ -197,6 +197,7 @@ def load_config():
     cfg = configparser.ConfigParser(interpolation=None)
     if not INI.exists():
         INI.write_text(DEFAULT_INI)
+        INI.chmod(0o600)                    # it will hold camera passwords
     cfg.read(INI)
     feeds = [clean_source(v) for _, v in cfg.items("feeds")] if cfg.has_section("feeds") else []
     opts = {
@@ -391,6 +392,11 @@ import shutil                                                                   
 import socket                                                                              # noqa: E402
 import tempfile                                                                            # noqa: E402
 HAVE_MPV = shutil.which("mpv") is not None
+# How camera feeds run mpv:
+#   process - a separate mpv drawing into the tile with --wid (Linux/X11; tested, default)
+#   lib     - libmpv inside multiview, drawing into an OpenGL widget. Needed on macOS,
+#             where a separate process can't draw into our window. pip install python-mpv
+MPV_MODE = os.environ.get("MULTIVIEW_MPV", "lib" if sys.platform == "darwin" else "process")
 
 
 # --------------------------------------------------------------------------- web plumbing
@@ -508,6 +514,12 @@ if HAVE_WEB:
             self.on_fullscreen = None        # set by the Cell: called with True/False
             self.in_fullscreen = False
             self.fullScreenRequested.connect(self._fullscreen)
+            self.featurePermissionRequested.connect(self._deny_permission)
+
+        def _deny_permission(self, origin, feature):
+            # camera, mic, location, notifications, screen capture ... always no
+            self.setFeaturePermission(origin, feature,
+                                      QWebEnginePage.PermissionPolicy.PermissionDeniedByUser)
 
         def _fullscreen(self, req):
             req.accept()
@@ -551,11 +563,17 @@ if HAVE_WEB:
     _PROFILE = None
     _INTERCEPTOR = None
 
+    def _refuse_download(item):
+        """A feed page never needs to save files - refuse every download."""
+        item.cancel()
+        print(f"multiview: blocked download of {item.url().toString()[:100]}")
+
     def web_profile():
         """One shared profile with the ad blocker and pop-up stub installed."""
         global _PROFILE, _INTERCEPTOR
         if _PROFILE is None:
             _PROFILE = QWebEngineProfile.defaultProfile()
+            _PROFILE.downloadRequested.connect(_refuse_download)
             if BLOCKER:
                 _INTERCEPTOR = AdInterceptor()
                 _PROFILE.setUrlRequestInterceptor(_INTERCEPTOR)
@@ -577,6 +595,141 @@ if HAVE_WEB:
         return _PROFILE
 
 
+# --------------------------------------------------------------------------- libmpv tiles
+_LIBMPV_TILE = None
+
+
+def libmpv_tile_class():
+    """Camera tile with mpv running *inside* multiview (libmpv render API), drawing
+    into a Qt OpenGL widget.  Used on macOS, where a separate mpv process can't
+    draw into our window (--wid takes an in-process NSView pointer there).
+    Same settings and reconnect rules as the mpv-process tiles."""
+    global _LIBMPV_TILE
+    if _LIBMPV_TILE is not None:
+        return _LIBMPV_TILE
+    try:
+        import mpv
+    except (ImportError, OSError) as e:
+        hint = ("brew install mpv && pip install python-mpv" if sys.platform == "darwin"
+                else "sudo apt install libmpv2 && pip install --user --break-system-packages python-mpv")
+        raise RuntimeError(f"libmpv / python-mpv is not available ({e}). Install: {hint}") from e
+    from PyQt6.QtCore import pyqtSignal
+    from PyQt6.QtGui import QOpenGLContext
+    from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+
+    def _get_proc_address(_unused, name):
+        ctx = QOpenGLContext.currentContext()
+        addr = ctx.getProcAddress(name) if ctx is not None else None
+        return int(addr) if addr else 0
+
+    get_proc_address = mpv.MpvGlGetProcAddressFn(_get_proc_address)
+
+    def end_reason(ev):
+        """python-mpv has passed end-file events as objects and as dicts over the years."""
+        data = getattr(ev, "data", None)
+        if data is None and isinstance(ev, dict):
+            data = ev.get("event", ev)
+        reason = data.get("reason") if isinstance(data, dict) else getattr(data, "reason", None)
+        if isinstance(reason, bytes):
+            reason = reason.decode()
+        return str(reason).lower()
+
+    class LibMpvTile(QOpenGLWidget):
+        frame_ready = pyqtSignal()
+        stream_ended = pyqtSignal()
+
+        def __init__(self, url, parent, delay_ms=0):
+            super().__init__(parent)
+            self.url, self.delay_ms = url, delay_ms
+            self.stopping, self.saw_401, self.first = False, False, True
+            self.retry_s, self.started_at = 5, 0.0
+            self.ctx = None
+            self.player = mpv.MPV(
+                vo="libmpv", log_handler=self._log, loglevel="warn",
+                profile="low-latency", hwdec="auto-safe", keep_open="no", idle="yes",
+                rtsp_transport="tcp", network_timeout=10,
+                demuxer_lavf_o="tls_verify=0",               # Wyze cams use a self-signed cert
+                osc="no", osd_level=0, input_default_bindings="no",
+                input_vo_keyboard="no", mute="yes")           # every feed starts muted
+            self.frame_ready.connect(self.update)
+            self.stream_ended.connect(self._ended)
+            self.player.event_callback("end-file")(self._on_end_file)
+
+        # mpv calls these from its own threads: only emit signals here
+        def _log(self, level, component, message):
+            if "401" in message or "Unauthorized" in message:
+                self.saw_401 = True
+            if VERBOSE:
+                print(f"  [mpv {mask_password(self.url)}] {component}: {message.rstrip()}")
+
+        def _on_end_file(self, ev):
+            # eof / error -> reconnect; stop / quit / redirect are our own doing
+            reason = end_reason(ev)
+            if reason in ("0", "4", "eof", "error"):
+                self.stream_ended.emit()
+
+        # ---- OpenGL
+        def initializeGL(self):
+            self.ctx = mpv.MpvRenderContext(
+                self.player, "opengl", opengl_init_params={"get_proc_address": get_proc_address})
+            self.ctx.update_cb = self.frame_ready.emit
+            if self.first:                            # start once there's somewhere to draw
+                self.first = False
+                QTimer.singleShot(max(self.delay_ms, 50), self.start)
+
+        def paintGL(self):
+            if self.ctx is not None:
+                r = self.devicePixelRatioF()
+                self.ctx.render(flip_y=True, opengl_fbo={
+                    "w": int(self.width() * r), "h": int(self.height() * r),
+                    "fbo": self.defaultFramebufferObject()})
+
+        # ---- playback
+        def start(self):
+            if self.stopping:
+                return
+            self.saw_401, self.started_at = False, time.monotonic()
+            self.player.loadfile(self.url)
+
+        def _ended(self):
+            if self.stopping:
+                return
+            shown = mask_password(self.url)
+            if self.saw_401:
+                # never retry a rejected login: Wyze cams lock you out after a few failures
+                print(f"multiview: {shown}: login rejected (401). Check the RTSP username/password "
+                      "set in the Wyze app, then press R on this feed to try again.")
+                return
+            if time.monotonic() - self.started_at > 60:
+                self.retry_s = 5                      # it was playing fine; retry quickly
+            print(f"multiview: {shown}: stream stopped, reconnecting in {self.retry_s}s")
+            QTimer.singleShot(self.retry_s * 1000, self.start)
+            self.retry_s = min(self.retry_s * 2, 60)
+
+        def restart(self):
+            self.retry_s = 5
+            self.start()                              # loadfile replaces the current stream
+
+        def set_muted(self, muted):
+            self.player.mute = bool(muted)
+
+        def stop(self):
+            self.stopping = True
+            try:
+                self.player.command("stop")           # lets ffmpeg send RTSP TEARDOWN
+            except Exception:
+                pass
+            if self.ctx is not None:
+                self.makeCurrent()
+                self.ctx.free()
+                self.ctx = None
+                self.doneCurrent()
+            self.player.terminate()
+
+    _LIBMPV_TILE = LibMpvTile
+    return LibMpvTile
+
+
 # --------------------------------------------------------------------------- players
 class Player:
     """Common interface over a web view or a VLC player."""
@@ -585,7 +738,10 @@ class Player:
         self.url = url
         self.started = False
         self.kind = "mpv" if is_camera(url) else "vlc" if is_media(url) else "web"
-        if self.kind == "mpv" and not HAVE_MPV:
+        self.tile = None                        # LibMpvTile when MPV_MODE == "lib"
+        if self.kind == "mpv" and MPV_MODE == "lib":
+            libmpv_tile_class()                 # raises a clear error if libmpv is missing
+        elif self.kind == "mpv" and not HAVE_MPV:
             raise RuntimeError("mpv is not installed (sudo apt install mpv)")
         if self.kind == "web" and not HAVE_WEB:
             raise RuntimeError("PyQt6-WebEngine is not installed "
@@ -600,6 +756,11 @@ class Player:
             s.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
             s.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
             s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+            # hardening: shut off features a video page doesn't need (less attack surface)
+            for attr in ("PluginsEnabled", "PdfViewerEnabled", "JavascriptCanAccessClipboard",
+                         "JavascriptCanPaste", "LocalContentCanAccessRemoteUrls",
+                         "LocalContentCanAccessFileUrls", "ScreenCaptureEnabled"):
+                s.setAttribute(getattr(QWebEngineSettings.WebAttribute, attr), False)
             page.setBackgroundColor(QColor("black"))      # no white flash / white edges
             self.widget.setPage(page)
             if BLOCKER:
@@ -608,6 +769,8 @@ class Player:
                 QTimer.singleShot(delay_ms, self.start)
             else:
                 self.start()
+        elif self.kind == "mpv" and MPV_MODE == "lib":
+            self.tile = self.widget = libmpv_tile_class()(url, parent, delay_ms)
         elif self.kind == "mpv":
             self.widget = QFrame(parent)
             self.widget.setStyleSheet("background:black;")
@@ -738,6 +901,8 @@ class Player:
     def set_muted(self, muted):
         if self.kind == "web":
             self.widget.page().setAudioMuted(muted)
+        elif self.tile:
+            self.tile.set_muted(muted)
         elif self.kind == "mpv":
             self.muted = muted
             self._mpv_cmd("set_property", "mute", muted)
@@ -756,6 +921,8 @@ class Player:
                 self.start()
             else:
                 self.widget.reload()
+        elif self.tile:
+            self.tile.restart()
         elif self.kind == "mpv":
             self.stopping = True                      # don't let the exit trigger a retry
             self._mpv_stop()
@@ -766,7 +933,9 @@ class Player:
             self.mp.play()
 
     def stop(self):
-        if self.kind == "mpv":
+        if self.tile:
+            self.tile.stop()
+        elif self.kind == "mpv":
             self.stopping = True
             self._mpv_stop()
             try:
@@ -1059,6 +1228,8 @@ def find_widevine():
     if setting.lower() != "auto":
         return setting if os.path.exists(setting) else None
     home = Path.home()
+    if sys.platform == "darwin":
+        return _find_widevine_mac(home)
     lib = "_platform_specific/linux_x64/libwidevinecdm.so"
     patterns = [                       # where Chrome, Chromium, Edge, Vivaldi, Brave, Electron... keep it
         (Path("/opt"), f"*/*/WidevineCdm/{lib}"),
@@ -1071,6 +1242,26 @@ def find_widevine():
         (home / ".local/share/flatpak/app", f"*/*/*/*/files/extra/WidevineCdm/{lib}"),
         (Path("/var/lib/flatpak/app"), f"*/*/*/*/files/extra/WidevineCdm/{lib}"),
     ]
+    return _newest_widevine(patterns)
+
+
+def _find_widevine_mac(home):
+    import platform
+    arch = "mac_arm64" if platform.machine() == "arm64" else "mac_x64"
+    lib = f"_platform_specific/{arch}/libwidevinecdm.dylib"
+    support = home / "Library/Application Support"
+    return _newest_widevine([
+        # the copy bundled inside Chrome / Edge / Brave / Vivaldi / Chromium .app
+        (Path("/Applications"), f"*.app/Contents/Frameworks/*.framework/Versions/*/Libraries/WidevineCdm/{lib}"),
+        (home / "Applications", f"*.app/Contents/Frameworks/*.framework/Versions/*/Libraries/WidevineCdm/{lib}"),
+        # the auto-updated copy in the browser's profile folder
+        (support, f"*/WidevineCdm/*/{lib}"),
+        (support, f"*/*/WidevineCdm/*/{lib}"),
+        (support, f"*/*/*/WidevineCdm/*/{lib}"),
+    ])
+
+
+def _newest_widevine(patterns):
     best, best_ver = None, ()
     for root, pattern in patterns:
         if not root.is_dir():
@@ -1112,8 +1303,19 @@ def install_terminal_quit():
     thread waits for them: the first one asks Qt to quit cleanly, and if the
     app is still alive 3 s later - or a second Ctrl+C arrives - it is killed.
     """
+    if not hasattr(signal, "pthread_sigmask"):     # Windows: Qt's default Ctrl+C handling
+        return
     sigs = {signal.SIGINT, signal.SIGTERM}
     signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+
+    def wait_more(seconds):
+        """Wait up to `seconds` for another Ctrl+C (macOS has no sigtimedwait)."""
+        if hasattr(signal, "sigtimedwait"):
+            signal.sigtimedwait(sigs, seconds)
+            return
+        t = threading.Thread(target=signal.sigwait, args=(sigs,), daemon=True)
+        t.start()
+        t.join(seconds)
 
     def waiter():
         signal.sigwait(sigs)
@@ -1121,7 +1323,7 @@ def install_terminal_quit():
         app = QApplication.instance()
         if app is not None:
             QMetaObject.invokeMethod(app, "quit", Qt.ConnectionType.QueuedConnection)
-            signal.sigtimedwait(sigs, 3)
+            wait_more(3)
         print("multiview: forced exit", flush=True)
         os._exit(130)
 
