@@ -35,7 +35,7 @@ Usage:
   ./multiview.py --logs=LEVEL ...     # terminal noise: all, important (default), fatal or none (also: log_level =)
   ./multiview.py --webrtc ...         # allow WebRTC peer-to-peer in web feeds this run (off by default;
                                       #   also: webrtc = on). --no-webrtc forces it off
-  ./multiview.py --auto-reload ...    # reload web feeds that never start playing (also: auto_reload = yes)
+  ./multiview.py --no-auto-reload ... # don't reload web feeds that fail to play (also: auto_reload = no)
   ./multiview.py --mpv-process ...    # cameras through a separate mpv (needs X11) for this run
                                       #   (default: libmpv when python-mpv is installed;
                                       #   also: camera_player = mpv | libmpv | auto)
@@ -138,9 +138,9 @@ allow_scripts =
 widevine = auto
 ; seconds between starting each web feed (and between reloads with Shift+R),
 ; so the site isn't hit with every stream/license request at once. 0 = all at once.
-; auto = one at a time: the next feed starts as soon as the previous one is
-;        playing (or after auto_reload_after seconds if it doesn't start)
-stagger = 3
+; auto (default) = one at a time: the next feed starts as soon as the previous one
+;        is playing (or after auto_reload_after seconds if it doesn't start)
+stagger = auto
 ; run inside the OS sandbox (bubblewrap / sandbox-exec). no = run unsandboxed
 sandbox = yes
 ; how much browser-engine (Chromium) logging to show in the terminal:
@@ -156,10 +156,11 @@ log_level = important
 ; If a web feed won't play, it may need WebRTC: set webrtc = on (or run with --webrtc).
 webrtc = off
 ; reload a web feed by itself if no video has started playing after
-; auto_reload_after seconds; the wait grows with each try, and it gives up after
-; auto_reload_tries (press R to try again). Feeds that have played are left alone.
-; Reloads happen one feed at a time, so the site isn't hit by all of them at once.
-auto_reload = no
+; auto_reload_after seconds, or if its player shows an error (e.g. "problem
+; providing access to protected content"); the wait grows with each try, and it
+; gives up after auto_reload_tries (press R to try again). Reloads happen one feed
+; at a time, so the site isn't hit by all of them at once.
+auto_reload = yes
 auto_reload_after = 20
 auto_reload_tries = 3
 ; how rtsp/rtsps cameras play: libmpv = mpv inside multiview (pip install
@@ -337,11 +338,11 @@ def load_config():
         "allow_scripts": {d.strip().lower() for d in
                           cfg.get("options", "allow_scripts", fallback="").split(",") if d.strip()},
         "widevine": cfg.get("options", "widevine", fallback="auto").strip(),
-        "stagger": _stagger_value(cfg.get("options", "stagger", fallback="3")),
-        "stagger_auto": cfg.get("options", "stagger", fallback="3").strip().lower() == "auto",
+        "stagger": _stagger_value(cfg.get("options", "stagger", fallback="auto")),
+        "stagger_auto": cfg.get("options", "stagger", fallback="auto").strip().lower() == "auto",
         "log_level": cfg.get("options", "log_level", fallback="important").strip().lower(),
         "webrtc": cfg.getboolean("options", "webrtc", fallback=False),
-        "auto_reload": cfg.getboolean("options", "auto_reload", fallback=False),
+        "auto_reload": cfg.getboolean("options", "auto_reload", fallback=True),
         "auto_reload_after": max(5.0, cfg.getfloat("options", "auto_reload_after", fallback=20.0)),
         "auto_reload_tries": max(1, cfg.getint("options", "auto_reload_tries", fallback=3)),
         "camera_player": cfg.get("options", "camera_player", fallback="auto").strip().lower(),
@@ -376,6 +377,8 @@ if "--no-webrtc" in sys.argv:
     OPTS["webrtc"] = False
 if "--auto-reload" in sys.argv:
     OPTS["auto_reload"] = True
+if "--no-auto-reload" in sys.argv:
+    OPTS["auto_reload"] = False
 # Watch for playing video when either feature needs to know.
 OPTS["watch_play"] = OPTS["auto_reload"] or OPTS["stagger_auto"]
 if "--libmpv" in sys.argv:
@@ -781,30 +784,55 @@ COSMETIC_JS = r"""
 # stagger = auto / auto_reload: runs in every frame (in multiview's own JS world, out of the page's
 # reach) and notices when a <video> is really playing. Player iframes usually come
 # from another site, so they report to the top page with postMessage; Python then
-# asks the top page whether anything has played.
+# asks the top page whether anything has played. It also notices a player stuck on an
+# error (JW Player / video.js error screen, or a <video> that failed - e.g. "problem
+# providing access to protected content"). Only an error seen on two checks in a row
+# counts (players that recover by themselves are left alone), and only while no video
+# on the page is playing (a blocked ad's <video> failing next to a fine stream is ignored).
 PLAY_WATCH_JS = r"""
 (() => {
   if (window.__mvWatch) return;
   window.__mvWatch = true;
   const top = window === window.top;
+  // 1 = has played, 2 = player error, 3 = a video is playing right now (heartbeat)
+  const note = code => {
+    if (code === 1) window.__mvPlayed = true;
+    if (code === 2) window.__mvError = true;
+    if (code === 3) window.__mvLastPlay = Date.now();
+  };
+  const report = code => {
+    if (top) note(code);
+    else try { window.top.postMessage({ __mvPlaying: code }, '*'); } catch (e) {}
+  };
   if (top) window.addEventListener('message', e => {
-    if (e.data && e.data.__mvPlaying === 1) window.__mvPlayed = true;
+    if (e.data && [1, 2, 3].includes(e.data.__mvPlaying)) note(e.data.__mvPlaying);
   });
-  let done = false, timer = 0;
+  const shown = el => el.offsetWidth > 0 && el.offsetHeight > 0;
+  const failed = () => {
+    for (const el of document.querySelectorAll('.jw-state-error, .vjs-error')) if (shown(el)) return true;
+    for (const v of document.querySelectorAll('video')) if (v.error && shown(v)) return true;
+    return false;
+  };
+  let played = false, errored = false, errorSeen = 0;
+  const last = new WeakMap();                // video -> currentTime at the previous check
   const check = () => {
-    if (done) return;
+    let playingNow = false;
     for (const v of document.querySelectorAll('video')) {
-      if (!v.paused && v.readyState >= 2 && v.currentTime > 0.5) {
-        done = true;
-        clearInterval(timer);
-        if (top) window.__mvPlayed = true;
-        else try { window.top.postMessage({ __mvPlaying: 1 }, '*'); } catch (e) {}
-        return;
+      const t = v.currentTime, before = last.get(v);
+      last.set(v, t);
+      if (!v.paused && v.readyState >= 2 && t > 0.5) {
+        if (!played) { played = true; report(1); }
+        if (before !== undefined && t > before) playingNow = true;
       }
     }
+    if (playingNow) report(3);
+    if (!errored) {
+      errorSeen = failed() ? errorSeen + 1 : 0;
+      if (errorSeen >= 2) { errored = true; report(2); }
+    }
   };
-  document.addEventListener('timeupdate', check, true);
-  timer = setInterval(check, 2000);
+  document.addEventListener('timeupdate', () => { if (!played) check(); }, true);
+  setInterval(check, 2000);
 })();
 """
 
@@ -1159,7 +1187,7 @@ class Player:
             if BLOCKER:
                 page.loadFinished.connect(self._on_loaded)
             if OPTS["watch_play"]:
-                self._auto_tries, self._load_t = 0, 0.0
+                self._auto_tries, self._load_t, self._playing_since = 0, 0.0, 0.0
                 self._watch = QTimer(self.widget)          # polls every 2 s while waiting
                 self._watch.timeout.connect(self._watch_check)
                 page.loadStarted.connect(self._watch_restart)
@@ -1211,31 +1239,50 @@ class Player:
     # ---- watch for playing video (stagger = auto: start the next feed; auto_reload: retry)
     def _watch_restart(self):
         """Every (re)load: poll until a video plays or the wait (longer each try) runs out."""
-        self._load_t = time.monotonic()
+        self._load_t, self._playing_since = time.monotonic(), 0.0
         self._watch.start(2000)
 
     def _watch_check(self):
-        self.widget.page().runJavaScript("!!window.__mvPlayed",
-                                         QWebEngineScript.ScriptWorldId.ApplicationWorld.value,
-                                         self._watch_result)
+        self.widget.page().runJavaScript(
+            "window.__mvError && Date.now() - (window.__mvLastPlay || 0) > 6000 ? 'error'"
+            " : window.__mvPlayed ? 'played' : ''",
+            QWebEngineScript.ScriptWorldId.ApplicationWorld.value, self._watch_result)
 
-    def _watch_result(self, played):
+    def _watch_result(self, state):
         if not self._watch.isActive():
             return                          # answer arrived after we stopped watching
         if self.widget.url().toString() == "about:blank":
             self._watch.stop()              # feed stopped
             start_done(self)
             return
-        elapsed = time.monotonic() - self._load_t
+        now = time.monotonic()
+        elapsed = now - self._load_t
         name = f"feed {getattr(self, 'index', '?')}"
-        if played:
+        if state == "error":
             self._watch.stop()
+            start_done(self)
+            if not OPTS["auto_reload"]:
+                print(f"multiview: {name}: the player shows an error "
+                      "(press R or the reload button to try again)")
+                return
+            if self._playing_since and now - self._playing_since > 60:
+                self._auto_tries = 0        # it had been playing fine: a fresh set of tries
+            self._auto_retry(name, "the player shows an error")
+            return
+        if state == "played":
+            if self._playing_since:
+                return                      # already playing; still watching for errors
+            self._playing_since = now
             how = ""
             if OPTS["auto_reload"]:
                 how = (f", after {self._auto_tries} automatic reload(s)" if self._auto_tries
                        else ", no automatic reloads needed")
             print(f"multiview: {name} playing ({int(elapsed)} s after loading{how})")
             start_done(self)
+            if OPTS["auto_reload"]:
+                self._watch.start(5000)     # keep an eye out for a player error
+            else:
+                self._watch.stop()
             return
         if elapsed < OPTS["auto_reload_after"] * (self._auto_tries + 1):
             return                          # keep waiting
@@ -1245,12 +1292,15 @@ class Player:
             print(f"multiview: {name} not playing after {int(elapsed)} s - moving on "
                   "(press R or the reload button to try it again)")
             return
+        self._auto_retry(name, f"not playing after {int(elapsed)} s")
+
+    def _auto_retry(self, name, why):
         if self._auto_tries >= OPTS["auto_reload_tries"]:
-            print(f"multiview: {name} still not playing after {self._auto_tries} automatic "
-                  "reloads - leaving it (press R or the reload button to try again)")
+            print(f"multiview: {name} {why} - giving up after {self._auto_tries} automatic "
+                  "reloads (press R or the reload button to try again)")
             return
         self._auto_tries += 1
-        print(f"multiview: {name} not playing after {int(elapsed)} s - reloading "
+        print(f"multiview: {name} {why} - reloading "
               f"(try {self._auto_tries}/{OPTS['auto_reload_tries']}, one feed at a time)")
         queue_start(self, self._reload_web)
 
