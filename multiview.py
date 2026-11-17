@@ -147,6 +147,16 @@ DEFAULT_MY_FILTERS = """\
 
 # --------------------------------------------------------------------------- sandbox
 SANDBOX_LAUNCHER = HERE / "multiview-sandbox.sh"
+# "on" inside the sandbox, "off" when turned off on purpose, otherwise why it failed
+SANDBOX_STATE = "on" if os.environ.get("MULTIVIEW_SANDBOXED") == "1" else "off"
+
+
+def _use_unsandboxed_cache():
+    """Runs outside the sandbox get their own ad-block cache. The sandbox can write
+    to its cache, so a compromised sandboxed run could otherwise leave a poisoned
+    filter list / engine.dat for the next unsandboxed run to load."""
+    global CACHE
+    CACHE = CACHE.with_name("multiview-unsandboxed")
 
 
 def _sandbox_wanted():
@@ -188,10 +198,16 @@ def _sandbox_works():
 
 def enter_sandbox():
     """Restart multiview inside the OS sandbox unless told not to."""
+    global SANDBOX_STATE
+    if SANDBOX_STATE == "on":
+        return
     if not _sandbox_wanted():
+        _use_unsandboxed_cache()
         return
     problem = _sandbox_works()
     if problem:
+        SANDBOX_STATE = problem
+        _use_unsandboxed_cache()
         print(f"multiview: WARNING - running WITHOUT the sandbox: {problem}\n"
               "           (use --no-sandbox or sandbox = no in multiview.ini to hide this)")
         return
@@ -1088,6 +1104,10 @@ class MultiView(QMainWindow):
     def __init__(self, sources):
         super().__init__()
         self.base_title = f"multiview - {len(sources)} feeds"
+        if SANDBOX_STATE == "off":
+            self.base_title += "  (not sandboxed)"
+        elif SANDBOX_STATE != "on":
+            self.base_title = "\u26a0 NOT SANDBOXED - " + self.base_title
         self.setWindowTitle(self.base_title)
         self.resize(1600, 900)
         self.setStyleSheet("background:black;")
@@ -1422,6 +1442,11 @@ def main():
         return
     win = MultiView(SOURCES)
     win.show()
+    if SANDBOX_STATE not in ("on", "off"):            # wanted the sandbox, but it failed
+        QMessageBox.warning(win, "multiview - not sandboxed",
+                            f"multiview is running WITHOUT its sandbox:\n\n{SANDBOX_STATE}\n\n"
+                            "Web pages are less contained than usual. Fix the problem above, or "
+                            "set  sandbox = no  in multiview.ini if you mean to run without it.")
     sys.exit(app.exec())
 
 
