@@ -46,7 +46,9 @@ broke out of the browser engine still couldn't reach the rest of your files.
 If the sandbox can't start, multiview says so and runs without it.
 
 Keys:
-  click    click a feed to hear it (others are muted; all start muted)
+  click    click a feed to hear it (others are muted; all start muted). That click
+           only picks the audio - the video keeps playing. Once a feed has the
+           audio, clicks go to its player (play button, menus ...)
   1-4      give audio to that feed
   A        audio from all feeds at once
   M        mute / unmute everything
@@ -1630,6 +1632,7 @@ class MultiView(QMainWindow):
         }
         for n in range(1, len(self.cells) + 1):
             keys[str(n)] = lambda n=n: self.set_audio(n)
+        self._swallowed = None              # widget whose mouse press we kept from the page
         QApplication.instance().installEventFilter(self)
         for k, fn in keys.items():
             sc = QShortcut(QKeySequence(k), self)
@@ -1645,15 +1648,25 @@ class MultiView(QMainWindow):
                 sc.activated.connect(self.toggle_fullscreen)
 
     def eventFilter(self, obj, ev):
-        """A mouse click anywhere on a feed gives that feed the audio."""
-        if ev.type() == QEvent.Type.MouseButtonPress and isinstance(obj, QWidget):
+        """A click on a feed that doesn't have the audio gives it the audio - and only
+        that: the web page doesn't see the click, so players that pause on a click keep
+        playing. Clicks on the feed that already has the audio reach the page as usual
+        (play buttons, overlays, quality menus ...)."""
+        t = ev.type()
+        if t == QEvent.Type.MouseButtonRelease and obj is self._swallowed:
+            self._swallowed = None
+            return True                     # the release that belongs to a swallowed press
+        if t == QEvent.Type.MouseButtonPress and isinstance(obj, QWidget):
             for cell in self.cells:
                 w = cell.player.widget if cell.player else None
                 if w is not None and (obj is w or w.isAncestorOf(obj)):
                     if self.audio != cell.index or self.audio_all or self.all_muted:
                         self.set_audio(cell.index)
+                        if cell.player.kind == "web":
+                            self._swallowed = obj
+                            return True     # just picking the audio: keep it from the page
                     break
-        return False                        # let the click reach the player too
+        return False                        # let the click reach the player
 
     def update_title(self):
         self.setWindowTitle(f"{self.base_title}  -  {BLOCKER.count:,} ads/trackers blocked")
