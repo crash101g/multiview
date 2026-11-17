@@ -35,6 +35,7 @@ Usage:
   ./multiview.py --logs=LEVEL ...     # terminal noise: all, important (default), fatal or none (also: log_level =)
   ./multiview.py --webrtc ...         # allow WebRTC peer-to-peer in web feeds this run (off by default;
                                       #   also: webrtc = on). --no-webrtc forces it off
+  ./multiview.py --auto-reload ...    # reload web feeds that never start playing (also: auto_reload = yes)
 
 Sandbox: multiview restarts itself inside an OS sandbox (bubblewrap on Linux,
 sandbox-exec on macOS - see multiview-sandbox.sh) so a hostile web page that
@@ -133,7 +134,9 @@ allow_scripts =
 ; Chrome/Edge/Vivaldi/Chromium etc., no = off, or a path to libwidevinecdm.so
 widevine = auto
 ; seconds between starting each web feed (and between reloads with Shift+R),
-; so the site isn't hit with every stream/license request at once. 0 = all at once
+; so the site isn't hit with every stream/license request at once. 0 = all at once.
+; auto = one at a time: the next feed starts as soon as the previous one is
+;        playing (or after auto_reload_after seconds if it doesn't start)
 stagger = 3
 ; run inside the OS sandbox (bubblewrap / sandbox-exec). no = run unsandboxed
 sandbox = yes
@@ -149,6 +152,13 @@ log_level = important
 ; connections (stops P2P video sharing / upload and local-IP leaks).
 ; If a web feed won't play, it may need WebRTC: set webrtc = on (or run with --webrtc).
 webrtc = off
+; reload a web feed by itself if no video has started playing after
+; auto_reload_after seconds; the wait grows with each try, and it gives up after
+; auto_reload_tries (press R to try again). Feeds that have played are left alone.
+; Reloads happen one feed at a time, so the site isn't hit by all of them at once.
+auto_reload = no
+auto_reload_after = 20
+auto_reload_tries = 3
 """
 
 DEFAULT_MY_FILTERS = """\
@@ -296,6 +306,14 @@ def site_of(host):
     return ".".join(parts[-2:])
 
 
+def _stagger_value(raw):
+    """Seconds between web-feed starts; 'auto' (one at a time) falls back to 3 for Shift+R."""
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 3.0
+
+
 def load_config():
     cfg = configparser.ConfigParser(interpolation=None)
     if not INI.exists():
@@ -314,9 +332,13 @@ def load_config():
         "allow_scripts": {d.strip().lower() for d in
                           cfg.get("options", "allow_scripts", fallback="").split(",") if d.strip()},
         "widevine": cfg.get("options", "widevine", fallback="auto").strip(),
-        "stagger": max(0.0, cfg.getfloat("options", "stagger", fallback=3.0)),
+        "stagger": _stagger_value(cfg.get("options", "stagger", fallback="3")),
+        "stagger_auto": cfg.get("options", "stagger", fallback="3").strip().lower() == "auto",
         "log_level": cfg.get("options", "log_level", fallback="important").strip().lower(),
         "webrtc": cfg.getboolean("options", "webrtc", fallback=False),
+        "auto_reload": cfg.getboolean("options", "auto_reload", fallback=False),
+        "auto_reload_after": max(5.0, cfg.getfloat("options", "auto_reload_after", fallback=20.0)),
+        "auto_reload_tries": max(1, cfg.getint("options", "auto_reload_tries", fallback=3)),
     }
     return [f for f in feeds if f], opts
 
@@ -346,6 +368,10 @@ if "--webrtc" in sys.argv:
     OPTS["webrtc"] = True
 if "--no-webrtc" in sys.argv:
     OPTS["webrtc"] = False
+if "--auto-reload" in sys.argv:
+    OPTS["auto_reload"] = True
+# Watch for playing video when either feature needs to know.
+OPTS["watch_play"] = OPTS["auto_reload"] or OPTS["stagger_auto"]
 SOURCES = [fix_camera_url(s) for s in (_cli or _ini_feeds)[:4]]
 
 if any(is_media(s) for s in SOURCES) and sys.platform.startswith("linux"):
@@ -657,6 +683,36 @@ COSMETIC_JS = r"""
 })
 """
 
+# stagger = auto / auto_reload: runs in every frame (in multiview's own JS world, out of the page's
+# reach) and notices when a <video> is really playing. Player iframes usually come
+# from another site, so they report to the top page with postMessage; Python then
+# asks the top page whether anything has played.
+PLAY_WATCH_JS = r"""
+(() => {
+  if (window.__mvWatch) return;
+  window.__mvWatch = true;
+  const top = window === window.top;
+  if (top) window.addEventListener('message', e => {
+    if (e.data && e.data.__mvPlaying === 1) window.__mvPlayed = true;
+  });
+  let done = false, timer = 0;
+  const check = () => {
+    if (done) return;
+    for (const v of document.querySelectorAll('video')) {
+      if (!v.paused && v.readyState >= 2 && v.currentTime > 0.5) {
+        done = true;
+        clearInterval(timer);
+        if (top) window.__mvPlayed = true;
+        else try { window.top.postMessage({ __mvPlaying: 1 }, '*'); } catch (e) {}
+        return;
+      }
+    }
+  };
+  document.addEventListener('timeupdate', check, true);
+  timer = setInterval(check, 2000);
+})();
+"""
+
 # Stream players start muted (autoplay rules) and show an "UNMUTE" button.
 # multiview decides what you hear with per-feed muting, so keep the players
 # themselves unmuted.
@@ -818,6 +874,14 @@ if HAVE_WEB:
                 s.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
                 s.setRunsOnSubFrames(True)
                 _PROFILE.scripts().insert(s)
+            if OPTS["watch_play"]:
+                a = QWebEngineScript()
+                a.setName("mv-play-watch")
+                a.setSourceCode(PLAY_WATCH_JS)
+                a.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+                a.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
+                a.setRunsOnSubFrames(True)
+                _PROFILE.scripts().insert(a)
             if not OPTS["webrtc"]:
                 w = QWebEngineScript()
                 w.setName("mv-no-webrtc")
@@ -999,7 +1063,14 @@ class Player:
             self.widget.setPage(page)
             if BLOCKER:
                 page.loadFinished.connect(self._on_loaded)
-            if delay_ms > 0:
+            if OPTS["watch_play"]:
+                self._auto_tries, self._load_t = 0, 0.0
+                self._watch = QTimer(self.widget)          # polls every 2 s while waiting
+                self._watch.timeout.connect(self._watch_check)
+                page.loadStarted.connect(self._watch_restart)
+            if delay_ms is None:
+                pass                        # stagger = auto: the start queue starts it
+            elif delay_ms > 0:
                 QTimer.singleShot(delay_ms, self.start)
             else:
                 self.start()
@@ -1041,6 +1112,52 @@ class Player:
                 self.mp.set_nsobject(wid)
             self.mp.set_media(self.inst.media_new(url))
             self.mp.play()
+
+    # ---- watch for playing video (stagger = auto: start the next feed; auto_reload: retry)
+    def _watch_restart(self):
+        """Every (re)load: poll until a video plays or the wait (longer each try) runs out."""
+        self._load_t = time.monotonic()
+        self._watch.start(2000)
+
+    def _watch_check(self):
+        self.widget.page().runJavaScript("!!window.__mvPlayed",
+                                         QWebEngineScript.ScriptWorldId.ApplicationWorld.value,
+                                         self._watch_result)
+
+    def _watch_result(self, played):
+        if not self._watch.isActive():
+            return                          # answer arrived after we stopped watching
+        if self.widget.url().toString() == "about:blank":
+            self._watch.stop()              # feed stopped
+            start_done(self)
+            return
+        elapsed = time.monotonic() - self._load_t
+        name = f"feed {getattr(self, 'index', '?')}"
+        if played:
+            self._watch.stop()
+            how = ""
+            if OPTS["auto_reload"]:
+                how = (f", after {self._auto_tries} automatic reload(s)" if self._auto_tries
+                       else ", no automatic reloads needed")
+            print(f"multiview: {name} playing ({int(elapsed)} s after loading{how})")
+            start_done(self)
+            return
+        if elapsed < OPTS["auto_reload_after"] * (self._auto_tries + 1):
+            return                          # keep waiting
+        self._watch.stop()
+        start_done(self)                    # let the next feed have its turn
+        if not OPTS["auto_reload"]:
+            print(f"multiview: {name} not playing after {int(elapsed)} s - moving on "
+                  "(press R or the reload button to try it again)")
+            return
+        if self._auto_tries >= OPTS["auto_reload_tries"]:
+            print(f"multiview: {name} still not playing after {self._auto_tries} automatic "
+                  "reloads - leaving it (press R or the reload button to try again)")
+            return
+        self._auto_tries += 1
+        print(f"multiview: {name} not playing after {int(elapsed)} s - reloading "
+              f"(try {self._auto_tries}/{OPTS['auto_reload_tries']}, one feed at a time)")
+        queue_start(self, self._reload_web)
 
     # ---- cosmetic filtering (hide ad elements the network filter didn't catch)
     def _on_loaded(self, ok):
@@ -1148,13 +1265,25 @@ class Player:
         if self.kind == "web" and not self.started:
             self.started = True
             self.widget.setUrl(QUrl(self.url))
+            if OPTS["watch_play"]:
+                self._watch_restart()
+
+    def _reload_web(self):
+        """Reload a web feed (no messages, no queue handling)."""
+        if not self.started:
+            self.start()
+        else:
+            self.widget.reload()
+        if OPTS["watch_play"]:
+            self._watch_restart()           # don't rely on loadStarted: restart the clock now
 
     def reload(self):
         if self.kind == "web":
-            if not self.started:
-                self.start()
-            else:
-                self.widget.reload()
+            if OPTS["watch_play"]:
+                self._auto_tries = 0        # a manual reload starts the count over
+                forget_queued(self)         # ... and replaces any reload waiting its turn
+                print(f"multiview: feed {getattr(self, 'index', '?')} reloaded by hand")
+            self._reload_web()
         elif self.tile:
             self.tile.restart()
         elif self.kind == "mpv":
@@ -1181,7 +1310,43 @@ class Player:
             self.mp.release()
             self.inst.release()
         else:
+            if OPTS["watch_play"]:
+                self._watch.stop()
+                forget_queued(self)
+                start_done(self)
             self.widget.setUrl(QUrl("about:blank"))
+
+
+# One feed at a time (stagger = auto, and auto_reload's reloads): many stream sites
+# fail when several players start at once but work when they start one by one.
+# A feed holds the "slot" from its (re)load until it plays or its wait runs out.
+_START_QUEUE = []                           # [(player, action)] waiting their turn
+_START_BUSY = None                          # player currently holding the slot
+
+
+def queue_start(player, action):
+    forget_queued(player)
+    _START_QUEUE.append((player, action))
+    _pump_starts()
+
+
+def forget_queued(player):
+    _START_QUEUE[:] = [(p, a) for p, a in _START_QUEUE if p is not player]
+
+
+def start_done(player):
+    global _START_BUSY
+    if _START_BUSY is player:
+        _START_BUSY = None
+        QTimer.singleShot(1000, _pump_starts)
+
+
+def _pump_starts():
+    global _START_BUSY
+    if _START_BUSY is None and _START_QUEUE:
+        player, action = _START_QUEUE.pop(0)
+        _START_BUSY = player
+        action()
 
 
 def paint_black(widget):
@@ -1230,6 +1395,7 @@ class Cell(QWidget):
 
         try:
             self.player = Player(url, self, delay_ms)
+            self.player.index = index
             lay.addWidget(self.player.widget, 1)
             if self.player.kind == "web":
                 self.player.widget.page().on_fullscreen = \
@@ -1275,10 +1441,19 @@ class MultiView(QMainWindow):
         web_n = 0
         self.cells = []
         for i, url in enumerate(sources):
-            delay = 0 if is_media(url) else web_n * step
+            if is_media(url):
+                delay = 0
+            elif OPTS["stagger_auto"]:
+                delay = None                # started below, one at a time
+            else:
+                delay = web_n * step
             web_n += 0 if is_media(url) else 1
             self.cells.append(Cell(i + 1, url, self, delay))
         self.layout_grid()
+        if OPTS["stagger_auto"]:
+            for cell in self.cells:
+                if cell.player and cell.player.kind == "web":
+                    queue_start(cell.player, cell.player.start)
         start = OPTS["audio"]
         if start == "all":
             self.set_audio_all()
@@ -1396,6 +1571,17 @@ class MultiView(QMainWindow):
 
     def reload_all(self):
         """Reload every feed, spaced out by the stagger setting."""
+        if OPTS["stagger_auto"]:
+            print("multiview: reloading all feeds, one at a time")
+            for cell in self.cells:
+                if not cell.player:
+                    continue
+                if cell.player.kind == "web":
+                    cell.player._auto_tries = 0
+                    queue_start(cell.player, cell.player._reload_web)
+                else:
+                    cell.player.reload()
+            return
         step = int(OPTS["stagger"] * 1000)
         n = 0
         for cell in self.cells:
