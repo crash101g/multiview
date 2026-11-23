@@ -43,7 +43,7 @@ The banners, sidebars and the fake "update your player" box are removed by the s
 **Ubuntu / Pop!_OS / Debian**
 
 ```bash
-sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine bubblewrap
+sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine bubblewrap python3-pip
 pip install --user --break-system-packages adblock      # Brave's engine (recommended)
 sudo apt install mpv                                     # only for rtsp/rtsps cameras
 # recommended: cameras through libmpv, so the sandbox can run without X11 (see Sandbox)
@@ -236,6 +236,25 @@ A feed that has played is only reloaded if its player then shows an error (JW Pl
 - `--no-adblock` turns blocking off for one run.
 
 **Known limit:** uBO's `##+js(...)` scriptlet rules (mostly used against anti-adblock walls) aren't run, because their code isn't part of Brave's engine. Network and element-hiding rules all work.
+
+### Ads still showing? Check that `adblock` is installed
+
+Pop-up windows are always blocked, so an ad that still appears is usually an **overlay drawn inside the tile**. Hiding those needs the element-hiding (`##`) rules, and only the `adblock` package can apply them. Without it multiview quietly falls back to the domain-only blocker, which hides nothing and misses ad networks that keep changing domains.
+
+Look at what multiview prints when it starts:
+
+- `ad blocking on (Brave adblock-rust engine)`: full blocking is on.
+- `ad blocking on (basic domain blocker, ...)`: `adblock` is missing.
+
+To fix it (on Ubuntu / Pop!_OS, `pip` isn't installed by default):
+
+```bash
+sudo apt install python3-pip
+python3 -m pip install --user --break-system-packages adblock
+./multiview.py --update-filters <feeds...>
+```
+
+The sandbox picks up pip `--user` packages, so the same install works for sandboxed runs. If one ad network still gets through, run with `-v`, find its domain (one that isn't in the blocked list) and add `||that-domain^` to `my-filters.txt`.
 
 ## Notes
 
